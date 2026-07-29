@@ -1,6 +1,7 @@
 import argparse
 import torch
-from networks import FullyConnected, Conv
+import torch.nn.functional as F
+from networks import FullyConnected, Conv, Normalization
 
 DEVICE = 'cpu'
 INPUT_SIZE = 28
@@ -9,11 +10,96 @@ INPUT_SIZE = 28
 def analyze(net, inputs, eps, true_label):
     """
         This is the function you are supposed to complete.
-        If the network can be verified to be robust --- always predicts the true label for any perturbation within eps added to the inputs, output True; otherwise False. 
+        If the network can be verified to be robust --- always predicts the true label for any perturbation within eps added to the inputs, output True; otherwise False.
     """
-    # TODO
-    return False
+    with torch.no_grad():
+        # Input interval: x_i - eps <= x_i <= x_i + eps
+        low = inputs - eps
+        high = inputs + eps
 
+        for layer in net.layers:
+            if isinstance(layer, Normalization):
+                mean = layer.mean.to(low.device).to(low.dtype)
+                sigma = layer.sigma.to(low.device).to(low.dtype)
+                low = (low - mean) / sigma
+                high = (high - mean) / sigma
+
+            elif isinstance(layer, torch.nn.Flatten):
+                low = low.reshape(low.size(0), -1)
+                high = high.reshape(high.size(0), -1)
+
+            elif isinstance(layer, torch.nn.Linear):
+                W = layer.weight.detach()
+                b = layer.bias.detach()
+
+                W_pos = torch.clamp(W, min=0)
+                W_neg = torch.clamp(W, max=0)
+
+                old_low, old_high = low, high
+                low = old_low @ W_pos.t() + old_high @ W_neg.t() + b
+                high = old_high @ W_pos.t() + old_low @ W_neg.t() + b
+
+            elif isinstance(layer, torch.nn.Conv2d):
+                W = layer.weight.detach()
+                b = layer.bias.detach() if layer.bias is not None else None
+
+                W_pos = torch.clamp(W, min=0)
+                W_neg = torch.clamp(W, max=0)
+
+                old_low, old_high = low, high
+
+                low_conv = F.conv2d(
+                    old_low, W_pos, None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups
+                )
+                low_conv += F.conv2d(
+                    old_high, W_neg, None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups
+                )
+
+                high_conv = F.conv2d(
+                    old_high, W_pos, None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups
+                )
+                high_conv += F.conv2d(
+                    old_low, W_neg, None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups
+                )
+
+                if b is not None:
+                    low_conv = low_conv + b.view(1, -1, 1, 1)
+                    high_conv = high_conv + b.view(1, -1, 1, 1)
+
+                low, high = low_conv, high_conv
+
+            elif isinstance(layer, torch.nn.ReLU):
+                low = torch.clamp(low, min=0)
+                high = torch.clamp(high, min=0)
+
+            else:
+                raise NotImplementedError("Unsupported layer type: %s" % type(layer))
+
+        # After all layers: compare true label vs others
+        low = low.squeeze(0)
+        high = high.squeeze(0)
+
+        true_low = low[true_label]
+        other_upper = high.clone()
+        other_upper[true_label] = -float('inf')
+
+        return bool(true_low > other_upper.max())
 
 def main():
     parser = argparse.ArgumentParser(description='Neural network verification')
