@@ -58,9 +58,9 @@ def analyze(model, x, eps, true_label):
         if isinstance(layer, Normalization):
             mean = layer.mean.view(-1)
             sigma = layer.sigma.view(-1)
-            x_flat = x.reshape(-1)
-            x_l = torch.clamp((x_flat - eps - mean) / sigma, 0.0, 1.0)
-            x_u = torch.clamp((x_flat + eps - mean) / sigma, 0.0, 1.0)
+
+            x_l = (x_l - mean) / sigma
+            x_u = (x_u - mean) / sigma
             continue
         # ---------------- Linear 层:精确的仿射组合 ----------------
         if isinstance(layer, torch.nn.Linear):
