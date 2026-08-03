@@ -13,24 +13,30 @@ NETWORK_NAMES = ['fc1', 'fc2', 'fc3', 'fc4', 'fc5', 'fc6', 'fc7', 'conv1', 'conv
 
 def analyze(model, x, eps, true_label):
     """
-    使用可学习 ReLU lower-bound slope 的 DeepPoly 风格验证器。
+    Hybrid IBP + affine-bound verifier with optimized ReLU slopes.
 
-    对不稳定 ReLU（l < 0 < u），使用：
+    Main changes compared with the previous version:
+      1. Keep both symbolic affine bounds and concrete IBP bounds.
+      2. At every ReLU, intersect the two pre-activation intervals before
+         constructing the relaxation. This keeps the useful fact ReLU(z) >= 0.
+      3. Replace separate output-logit bounds with direct pairwise margins:
+             f_true(x) - f_other(x) > 0.
+      4. First optimize one shared set of slopes; then optimize a separate set
+         for each still-unproved target class. Different sound relaxations may
+         be used to prove different pairwise inequalities.
 
-        alpha * z <= ReLU(z),    alpha in [0, 1]
+    For every unstable ReLU l < 0 < u, the symbolic lower relaxation is
 
-    其中 alpha 不再固定为 0/1，而是针对当前测试样本，用 Adam 最大化
-    最差分类 margin：
+        ReLU(z) >= alpha * z,   alpha in [0, 1].
 
-        min_{j != y} (lower(logit_y) - upper(logit_j))
-
-    每次传播对于任意 alpha in [0, 1] 都保持 sound；优化只是在 sound 的
-    松弛族中寻找更紧的一组 alpha。
+    All computation is CPU-compatible and uses only PyTorch.
     """
-    # 这些值可以在开发集上调整。CPU 时间紧时可把 OPT_STEPS 降到 10~15。
-    OPT_STEPS = 25
+    # Keep these modest for the 3-minute per-case limit. Increase them only
+    # after measuring the slowest convolutional case on your machine.
+    SHARED_OPT_STEPS = 18
+    TARGET_OPT_STEPS = 12
     OPT_LR = 5e-2
-    OPT_TEMPERATURE = 1.0
+    OPT_TEMPERATURE = 0.5
     OPT_INIT_EPS = 5e-2
     CERT_TOL = 1e-8
 
@@ -38,10 +44,24 @@ def analyze(model, x, eps, true_label):
     device = x.device
     dtype = x.dtype
 
-    x_flat = x.detach().reshape(-1)
+    layers = list(model.layers.children())
+    if not layers or not isinstance(layers[-1], torch.nn.Linear):
+        raise NotImplementedError(
+            'This implementation expects the final network layer to be Linear.'
+        )
+
+    body_layers = layers[:-1]
+    output_layer = layers[-1]
+
+    x_detached = x.detach()
+    x_flat = x_detached.reshape(-1)
     input_dim = x_flat.numel()
+
+    # The project perturbation set is also clipped to the valid image range.
     original_x_l = torch.clamp(x_flat - eps, 0.0, 1.0)
     original_x_u = torch.clamp(x_flat + eps, 0.0, 1.0)
+    original_box_l = original_x_l.reshape_as(x_detached)
+    original_box_u = original_x_u.reshape_as(x_detached)
 
     other_labels = torch.tensor(
         [label for label in range(10) if label != true_label],
@@ -49,8 +69,10 @@ def analyze(model, x, eps, true_label):
         dtype=torch.long,
     )
 
+    float_eps = torch.finfo(dtype).eps
+
     def concrete_bounds(A_low, b_low, A_high, b_high, x_l, x_u):
-        """在输入 box [x_l, x_u] 上求仿射下界/上界的具体值。"""
+        """Concretize affine lower/upper expressions over [x_l, x_u]."""
         A_low_pos = A_low.clamp(min=0)
         A_low_neg = A_low.clamp(max=0)
         A_high_pos = A_high.clamp(min=0)
@@ -60,17 +82,38 @@ def analyze(model, x, eps, true_label):
         high = A_high_pos @ x_u + A_high_neg @ x_l + b_high
         return low, high
 
-    def propagate(alpha_params=None, initialize_alpha=False):
-        """
-        传播一次并返回 9 个分类 margin 下界。
+    def concrete_lower(A, b, x_l, x_u):
+        """Concretize only a symbolic lower affine expression."""
+        A_pos = A.clamp(min=0)
+        A_neg = A.clamp(max=0)
+        return A_pos @ x_l + A_neg @ x_u + b
 
-        initialize_alpha=True 时，为每一个 ReLU 层建立一个与该层神经元数
-        相同的可学习向量。稳定 ReLU 的 alpha 不会被使用，也不会产生梯度；
-        使用整层向量可以避免优化过程中 cross mask 改变导致索引错位。
+    def make_parameters(alpha_values, move_inside=False):
+        """Clone slope tensors as independent learnable parameters."""
+        params = []
+        for value in alpha_values:
+            init = value.detach().clone()
+            if move_inside:
+                init.clamp_(OPT_INIT_EPS, 1.0 - OPT_INIT_EPS)
+            params.append(torch.nn.Parameter(init))
+        return params
+
+    def project_alphas(alpha_params):
+        with torch.no_grad():
+            for alpha in alpha_params:
+                alpha.clamp_(0.0, 1.0)
+
+    def propagate(alpha_params=None, initialize_alpha=False, target_positions=None):
+        """
+        Propagate hybrid bounds and return direct lower bounds on output margins.
+
+        target_positions indexes `other_labels`, not the original class labels.
+        When it is None, all nine pairwise margins are returned.
         """
         if alpha_params is None:
             alpha_params = []
 
+        # Symbolic bounds are expressed over the current normalized input box.
         x_l = original_x_l
         x_u = original_x_u
 
@@ -79,51 +122,88 @@ def analyze(model, x, eps, true_label):
         b_low = torch.zeros(input_dim, device=device, dtype=dtype)
         b_high = torch.zeros(input_dim, device=device, dtype=dtype)
 
-        cur_shape = tuple(x.shape[-3:]) if x.dim() >= 3 else None
+        # A second, independent IBP state is preserved throughout the network.
+        box_low = original_box_l
+        box_high = original_box_u
+
+        cur_shape = tuple(x_detached.shape[-3:]) if x_detached.dim() >= 3 else None
         relu_id = 0
 
-        for layer in model.layers.children():
+        for layer in body_layers:
             if isinstance(layer, Normalization):
-                # 标准差为正，因此区间端点顺序不变。
-                mean = layer.mean.detach().to(device=device, dtype=dtype).view(-1)
-                sigma = layer.sigma.detach().to(device=device, dtype=dtype).view(-1)
-                x_l = (x_l - mean) / sigma
-                x_u = (x_u - mean) / sigma
+                mean_full = layer.mean.detach().to(device=device, dtype=dtype)
+                sigma_full = layer.sigma.detach().to(device=device, dtype=dtype)
+                if torch.any(sigma_full <= 0):
+                    raise ValueError('Normalization sigma must be positive.')
+
+                # Update the IBP tensor state.
+                box_low = (box_low - mean_full) / sigma_full
+                box_high = (box_high - mean_full) / sigma_full
+
+                # The symbolic identity is now interpreted over the normalized
+                # input interval, so only its domain endpoints change.
+                mean_flat = mean_full.reshape(-1)
+                sigma_flat = sigma_full.reshape(-1)
+                x_l = (x_l - mean_flat) / sigma_flat
+                x_u = (x_u - mean_flat) / sigma_flat
+                continue
+
+            if isinstance(layer, torch.nn.Flatten):
+                box_low = box_low.reshape(box_low.size(0), -1)
+                box_high = box_high.reshape(box_high.size(0), -1)
+                cur_shape = None
                 continue
 
             if isinstance(layer, torch.nn.Linear):
-                # detach 网络权重，使 autograd 只计算 alpha 的梯度。
                 W = layer.weight.detach().to(device=device, dtype=dtype)
-                b = None if layer.bias is None else layer.bias.detach().to(device=device, dtype=dtype)
+                b = None if layer.bias is None else layer.bias.detach().to(
+                    device=device, dtype=dtype
+                )
                 W_pos = W.clamp(min=0)
                 W_neg = W.clamp(max=0)
 
+                # Symbolic affine propagation.
                 new_A_low = W_pos @ A_low + W_neg @ A_high
                 new_A_high = W_pos @ A_high + W_neg @ A_low
                 new_b_low = W_pos @ b_low + W_neg @ b_high
                 new_b_high = W_pos @ b_high + W_neg @ b_low
-
                 if b is not None:
                     new_b_low = new_b_low + b
                     new_b_high = new_b_high + b
-
                 A_low, A_high = new_A_low, new_A_high
                 b_low, b_high = new_b_low, new_b_high
+
+                # Parallel IBP propagation.
+                box_low_flat = box_low.reshape(box_low.size(0), -1)
+                box_high_flat = box_high.reshape(box_high.size(0), -1)
+                new_box_low = box_low_flat @ W_pos.t() + box_high_flat @ W_neg.t()
+                new_box_high = box_high_flat @ W_pos.t() + box_low_flat @ W_neg.t()
+                if b is not None:
+                    new_box_low = new_box_low + b
+                    new_box_high = new_box_high + b
+                box_low, box_high = new_box_low, new_box_high
+                cur_shape = None
                 continue
 
             if isinstance(layer, torch.nn.Conv2d):
                 if cur_shape is None:
-                    raise RuntimeError('Conv2d encountered without a valid feature-map shape.')
+                    # Recover the feature-map shape directly from the IBP state.
+                    if box_low.dim() != 4:
+                        raise RuntimeError(
+                            'Conv2d encountered without a valid feature-map shape.'
+                        )
+                    cur_shape = tuple(box_low.shape[-3:])
 
                 W = layer.weight.detach().to(device=device, dtype=dtype)
-                b = None if layer.bias is None else layer.bias.detach().to(device=device, dtype=dtype)
+                b = None if layer.bias is None else layer.bias.detach().to(
+                    device=device, dtype=dtype
+                )
                 C_in, H_in, W_in = cur_shape
                 W_pos = W.clamp(min=0)
                 W_neg = W.clamp(max=0)
 
                 def conv_coeff(weight, coeff):
-                    # coeff: [N_prev, input_dim]
-                    # 将 input_dim 当作 batch，一次卷积所有输入基向量的系数图。
+                    # coeff: [N_previous, input_dim]. Treat input_dim as batch.
                     coeff_img = coeff.t().reshape(input_dim, C_in, H_in, W_in)
                     return F.conv2d(
                         coeff_img,
@@ -138,7 +218,6 @@ def analyze(model, x, eps, true_label):
                 low_img = conv_coeff(W_pos, A_low) + conv_coeff(W_neg, A_high)
                 high_img = conv_coeff(W_pos, A_high) + conv_coeff(W_neg, A_low)
                 C_out, H_out, W_out = low_img.shape[1:]
-
                 new_A_low = low_img.reshape(input_dim, -1).t()
                 new_A_high = high_img.reshape(input_dim, -1).t()
 
@@ -156,32 +235,78 @@ def analyze(model, x, eps, true_label):
 
                 new_b_low = conv_bias(W_pos, b_low) + conv_bias(W_neg, b_high)
                 new_b_high = conv_bias(W_pos, b_high) + conv_bias(W_neg, b_low)
-
                 if b is not None:
-                    expanded_bias = b.view(-1, 1, 1).expand(C_out, H_out, W_out).reshape(-1)
+                    expanded_bias = b.view(-1, 1, 1).expand(
+                        C_out, H_out, W_out
+                    ).reshape(-1)
                     new_b_low = new_b_low + expanded_bias
                     new_b_high = new_b_high + expanded_bias
-
                 A_low, A_high = new_A_low, new_A_high
                 b_low, b_high = new_b_low, new_b_high
+
+                # Parallel convolutional IBP propagation.
+                new_box_low = F.conv2d(
+                    box_low,
+                    W_pos,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups,
+                ) + F.conv2d(
+                    box_high,
+                    W_neg,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups,
+                )
+                new_box_high = F.conv2d(
+                    box_high,
+                    W_pos,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups,
+                ) + F.conv2d(
+                    box_low,
+                    W_neg,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups,
+                )
+                if b is not None:
+                    bias_img = b.view(1, -1, 1, 1)
+                    new_box_low = new_box_low + bias_img
+                    new_box_high = new_box_high + bias_img
+                box_low, box_high = new_box_low, new_box_high
                 cur_shape = (C_out, H_out, W_out)
                 continue
 
-            if isinstance(layer, torch.nn.Flatten):
-                # 系数本来就是 flatten 后的二维矩阵，只需保留 cur_shape 供此前卷积使用。
-                continue
-
             if isinstance(layer, torch.nn.ReLU):
-                l, u = concrete_bounds(A_low, b_low, A_high, b_high, x_l, x_u)
-                neuron_count = l.numel()
+                affine_l, affine_u = concrete_bounds(
+                    A_low, b_low, A_high, b_high, x_l, x_u
+                )
+                box_l_flat = box_low.reshape(-1)
+                box_u_flat = box_high.reshape(-1)
+
+                # Intersect two independently sound abstractions.
+                l = torch.maximum(affine_l, box_l_flat)
+                u = torch.minimum(affine_u, box_u_flat)
+
+                # Avoid tiny contradictory intervals caused only by float noise.
+                u = torch.maximum(u, l)
 
                 neg_mask = u <= 0
                 pos_mask = l >= 0
                 cross_mask = (~neg_mask) & (~pos_mask)
+                neuron_count = l.numel()
 
                 if initialize_alpha:
-                    # 使用原 DeepPoly 0/1 heuristic 作为优化起点。
-                    # 为整层建立参数，避免后续 cross_mask 改变时参数索引错位。
                     initial_alpha = torch.where(
                         u >= -l,
                         torch.ones_like(l),
@@ -195,7 +320,6 @@ def analyze(model, x, eps, true_label):
                     raise RuntimeError(
                         'Missing alpha parameters for ReLU layer {}'.format(relu_id)
                     )
-
                 alpha = alpha_params[relu_id]
                 if alpha.numel() != neuron_count:
                     raise RuntimeError(
@@ -205,16 +329,12 @@ def analyze(model, x, eps, true_label):
                     )
                 relu_id += 1
 
-                # 即使调用方忘记投影，也保证传播中实际 slope 始终在 [0,1]。
                 alpha_safe = alpha.clamp(0.0, 1.0)
-
                 zeros = torch.zeros_like(l)
                 ones = torch.ones_like(l)
 
-                # Lower relaxation:
-                #   stable negative -> 0
-                #   stable positive -> identity
-                #   unstable       -> alpha * z
+                # Symbolic lower relaxation. The separate box state retains
+                # the stronger concrete fact ReLU(z) >= 0.
                 lower_scale = torch.where(
                     pos_mask,
                     ones,
@@ -223,11 +343,17 @@ def analyze(model, x, eps, true_label):
                 A_low = lower_scale.unsqueeze(1) * A_low
                 b_low = lower_scale * b_low
 
-                # Upper relaxation for unstable ReLU:
-                #   ReLU(z) <= lambda * z - lambda * l,
-                #   lambda = u / (u - l)
-                denominator = (u - l).clamp_min(torch.finfo(dtype).eps)
-                upper_slope_cross = u / denominator
+                # Standard secant upper relaxation over the tightened [l, u].
+                denominator = torch.where(
+                    cross_mask,
+                    (u - l).clamp_min(float_eps),
+                    torch.ones_like(u),
+                )
+                upper_slope_cross = torch.where(
+                    cross_mask,
+                    u / denominator,
+                    torch.zeros_like(u),
+                )
                 upper_scale = torch.where(
                     pos_mask,
                     ones,
@@ -240,89 +366,167 @@ def analyze(model, x, eps, true_label):
                 )
                 A_high = upper_scale.unsqueeze(1) * A_high
                 b_high = upper_scale * b_high + upper_intercept
+
+                # Keep exact interval non-negativity for all future IBP steps.
+                box_low = torch.clamp(l, min=0).reshape_as(box_low)
+                box_high = torch.clamp(u, min=0).reshape_as(box_high)
                 continue
 
-            raise NotImplementedError('Unsupported layer type: {}'.format(type(layer)))
+            raise NotImplementedError(
+                'Unsupported layer type before output: {}'.format(type(layer))
+            )
 
-        low, high = concrete_bounds(A_low, b_low, A_high, b_high, x_l, x_u)
-        margins = low[true_label] - high.index_select(0, other_labels)
-        return margins, alpha_params
+        # Directly propagate pairwise margins through the final Linear layer.
+        W_out = output_layer.weight.detach().to(device=device, dtype=dtype)
+        b_out = output_layer.bias
+        if b_out is None:
+            b_out = torch.zeros(W_out.size(0), device=device, dtype=dtype)
+        else:
+            b_out = b_out.detach().to(device=device, dtype=dtype)
 
-    # 第一次传播：建立 alpha，并以原来的 0/1 heuristic 初始化。
-    alpha_params = []
+        if target_positions is None:
+            selected_labels = other_labels
+        else:
+            selected_labels = other_labels.index_select(0, target_positions)
+
+        W_margin = W_out[true_label].unsqueeze(0) - W_out.index_select(
+            0, selected_labels
+        )
+        b_margin = b_out[true_label] - b_out.index_select(0, selected_labels)
+        W_margin_pos = W_margin.clamp(min=0)
+        W_margin_neg = W_margin.clamp(max=0)
+
+        margin_A_low = W_margin_pos @ A_low + W_margin_neg @ A_high
+        margin_b_low = (
+            W_margin_pos @ b_low
+            + W_margin_neg @ b_high
+            + b_margin
+        )
+        affine_margin_lower = concrete_lower(
+            margin_A_low, margin_b_low, x_l, x_u
+        )
+
+        box_l_flat = box_low.reshape(-1)
+        box_u_flat = box_high.reshape(-1)
+        box_margin_lower = (
+            W_margin_pos @ box_l_flat
+            + W_margin_neg @ box_u_flat
+            + b_margin
+        )
+
+        # Either sound abstraction may prove the margin; their maximum remains
+        # a sound lower bound because both are lower bounds on the same value.
+        hybrid_margin_lower = torch.maximum(
+            affine_margin_lower,
+            box_margin_lower,
+        )
+        return hybrid_margin_lower, alpha_params
+
+    # Build the initial 0/1 DeepPoly heuristic and evaluate all margins.
+    initial_alpha_params = []
     with torch.enable_grad():
-        initial_margins, alpha_params = propagate(
-            alpha_params=alpha_params,
+        initial_margins, initial_alpha_params = propagate(
+            alpha_params=initial_alpha_params,
             initialize_alpha=True,
         )
 
-    initial_min_margin = float(initial_margins.min().detach())
-    if initial_min_margin > CERT_TOL:
+    certified = initial_margins.detach() > CERT_TOL
+    if bool(certified.all()):
         return True
 
-    # 没有 ReLU 时不存在可优化参数。
-    if not alpha_params:
+    if not initial_alpha_params:
         return False
 
-    optimizer = torch.optim.Adam(alpha_params, lr=OPT_LR)
-
-    best_min_margin = initial_min_margin
-    best_alpha = [alpha.detach().clone() for alpha in alpha_params]
-
-    # 0/1 是很好的离散 heuristic，但从边界直接做投影优化容易被卡住。
-    # 先保存它作为候选最优解，再把优化起点轻微移入 (0,1)。
-    with torch.no_grad():
-        for alpha in alpha_params:
-            alpha.mul_(1.0 - 2.0 * OPT_INIT_EPS).add_(OPT_INIT_EPS)
+    # Preserve the exact heuristic as a candidate, but optimize from slightly
+    # inside the interval so projected Adam is less likely to stick at 0 or 1.
+    shared_params = make_parameters(initial_alpha_params, move_inside=True)
+    shared_optimizer = torch.optim.Adam(shared_params, lr=OPT_LR)
 
     with torch.enable_grad():
-        for _ in range(OPT_STEPS):
-            optimizer.zero_grad(set_to_none=True)
+        for _ in range(SHARED_OPT_STEPS):
+            shared_optimizer.zero_grad(set_to_none=True)
+            margins, _ = propagate(alpha_params=shared_params)
 
-            margins, _ = propagate(alpha_params=alpha_params)
-            exact_min_margin = margins.min()
-            current_value = float(exact_min_margin.detach())
-
-            if current_value > best_min_margin:
-                best_min_margin = current_value
-                best_alpha = [alpha.detach().clone() for alpha in alpha_params]
-
-            # 已经找到严格为正的所有分类 margin，可以立即返回。
-            if current_value > CERT_TOL:
+            # Different iterations may certify different target classes. This
+            # is sound: each pairwise inequality may use its own relaxation.
+            certified = certified | (margins.detach() > CERT_TOL)
+            if bool(certified.all()):
                 return True
 
-            # smooth max(-margin)，等价于平滑地最大化最差 margin；
-            # 相比直接 -margins.min()，切换最差类别时梯度通常更稳定。
+            unresolved = ~certified
+            unresolved_margins = margins[unresolved]
+            if unresolved_margins.numel() == 0:
+                return True
+
             loss = OPT_TEMPERATURE * torch.logsumexp(
-                -margins / OPT_TEMPERATURE,
+                -unresolved_margins / OPT_TEMPERATURE,
                 dim=0,
             )
-
             if not torch.isfinite(loss):
                 break
 
             loss.backward()
-            optimizer.step()
+            shared_optimizer.step()
+            project_alphas(shared_params)
 
-            # Projected Adam：保证每个 slope 都位于 sound 区间 [0,1]。
-            with torch.no_grad():
-                for alpha in alpha_params:
-                    alpha.clamp_(0.0, 1.0)
-
-    # 检查最后一次 optimizer 更新后的 alpha（循环内部尚未 forward 这一状态）。
+    # Check the state after the final shared optimizer update.
     with torch.no_grad():
-        final_margins, _ = propagate(alpha_params=alpha_params)
-        final_min_margin = float(final_margins.min())
-        if final_min_margin > best_min_margin:
-            best_min_margin = final_min_margin
-            best_alpha = [alpha.detach().clone() for alpha in alpha_params]
+        shared_margins, _ = propagate(alpha_params=shared_params)
+        certified = certified | (shared_margins > CERT_TOL)
+        if bool(certified.all()):
+            return True
 
-        # 恢复整个优化过程中最好的 slope，而不是盲目采用最后一步。
-        for alpha, saved_alpha in zip(alpha_params, best_alpha):
-            alpha.copy_(saved_alpha)
+    # Optimize a separate slope set for each remaining target class. A distinct
+    # alpha proof for each f_true - f_target inequality is still fully sound.
+    unresolved_positions = (~certified).nonzero(as_tuple=True)[0].tolist()
 
-        certified_margins, _ = propagate(alpha_params=alpha_params)
-        return bool(certified_margins.min().item() > CERT_TOL)
+    # Start each target-specific search from the shared result, which usually
+    # gives a better warm start than returning to the original 0/1 heuristic.
+    shared_values = [alpha.detach().clone() for alpha in shared_params]
+
+    for target_position in unresolved_positions:
+        target_index = torch.tensor(
+            [target_position], device=device, dtype=torch.long
+        )
+        target_params = make_parameters(shared_values, move_inside=False)
+        target_optimizer = torch.optim.Adam(target_params, lr=OPT_LR)
+
+        target_certified = False
+        with torch.enable_grad():
+            for _ in range(TARGET_OPT_STEPS):
+                target_optimizer.zero_grad(set_to_none=True)
+                target_margin, _ = propagate(
+                    alpha_params=target_params,
+                    target_positions=target_index,
+                )
+                scalar_margin = target_margin[0]
+
+                if float(scalar_margin.detach()) > CERT_TOL:
+                    target_certified = True
+                    break
+
+                loss = -scalar_margin
+                if not torch.isfinite(loss):
+                    break
+
+                loss.backward()
+                target_optimizer.step()
+                project_alphas(target_params)
+
+        if not target_certified:
+            with torch.no_grad():
+                final_target_margin, _ = propagate(
+                    alpha_params=target_params,
+                    target_positions=target_index,
+                )
+                target_certified = bool(
+                    final_target_margin[0].item() > CERT_TOL
+                )
+
+        if not target_certified:
+            return False
+
+    return True
 
 def load_network(net_name):
     if net_name == 'fc1':
