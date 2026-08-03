@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +12,7 @@ NETWORK_NAMES = ['fc1', 'fc2', 'fc3', 'fc4', 'fc5', 'fc6', 'fc7', 'conv1', 'conv
 
 
 
-def analyze(model, x, eps, true_label):
+def _analyze_forward_hybrid(model, x, eps, true_label):
     """
     Hybrid IBP + affine-bound verifier with optimized ReLU slopes.
 
@@ -527,6 +528,520 @@ def analyze(model, x, eps, true_label):
             return False
 
     return True
+
+
+
+def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0):
+    """
+    Target-specific CROWN/DeepPoly backward substitution with optimized ReLU
+    lower slopes. This path is mainly intended as a fallback for convolutional
+    cases that the forward hybrid verifier cannot certify.
+
+    Soundness:
+      * Forward IBP supplies sound pre-activation intervals [l, u].
+      * For an unstable ReLU, the lower line alpha*z is sound for every
+        alpha in [0, 1].
+      * A positive backward coefficient uses the lower line; a negative
+        coefficient uses the fixed upper secant.
+      * Each competing class is proved independently, so it may use its own
+        optimized slope tensors.
+    """
+    CROWN_OPT_STEPS = 32
+    CROWN_LR = 8e-2
+    CERT_TOL = 1e-7
+    PARAM_EPS = 2e-3
+
+    model.eval()
+    device = x.device
+    dtype = x.dtype
+    deadline = time.perf_counter() + max(1.0, float(time_budget_seconds))
+
+    layers = list(model.layers.children())
+    if not layers or not isinstance(layers[-1], torch.nn.Linear):
+        raise NotImplementedError(
+            'CROWN fallback expects the final network layer to be Linear.'
+        )
+
+    input_low = torch.clamp(x.detach() - eps, 0.0, 1.0)
+    input_high = torch.clamp(x.detach() + eps, 0.0, 1.0)
+
+    def _pair(value):
+        if isinstance(value, tuple):
+            return value
+        return (value, value)
+
+    def _sum_nonbatch(tensor):
+        if tensor.dim() <= 1:
+            return tensor
+        return tensor.reshape(tensor.size(0), -1).sum(dim=1)
+
+    # ------------------------------------------------------------------
+    # Stage 1: forward IBP. Keep one record per network layer so the
+    # backward pass can invert Flatten shapes and use each ReLU's [l, u].
+    # ------------------------------------------------------------------
+    records = []
+    low = input_low
+    high = input_high
+
+    with torch.no_grad():
+        for layer in layers:
+            input_shape = tuple(low.shape)
+
+            if isinstance(layer, Normalization):
+                mean = layer.mean.detach().to(device=device, dtype=dtype)
+                sigma = layer.sigma.detach().to(device=device, dtype=dtype)
+                if torch.any(sigma <= 0):
+                    raise ValueError('Normalization sigma must be positive.')
+                low = (low - mean) / sigma
+                high = (high - mean) / sigma
+                records.append({
+                    'layer': layer,
+                    'input_shape': input_shape,
+                    'output_shape': tuple(low.shape),
+                    'mean': mean,
+                    'sigma': sigma,
+                })
+                continue
+
+            if isinstance(layer, torch.nn.Flatten):
+                low = low.reshape(low.size(0), -1)
+                high = high.reshape(high.size(0), -1)
+                records.append({
+                    'layer': layer,
+                    'input_shape': input_shape,
+                    'output_shape': tuple(low.shape),
+                })
+                continue
+
+            if isinstance(layer, torch.nn.Linear):
+                weight = layer.weight.detach().to(device=device, dtype=dtype)
+                bias = None if layer.bias is None else layer.bias.detach().to(
+                    device=device, dtype=dtype
+                )
+                weight_pos = weight.clamp(min=0)
+                weight_neg = weight.clamp(max=0)
+                old_low = low.reshape(low.size(0), -1)
+                old_high = high.reshape(high.size(0), -1)
+                low = old_low @ weight_pos.t() + old_high @ weight_neg.t()
+                high = old_high @ weight_pos.t() + old_low @ weight_neg.t()
+                if bias is not None:
+                    low = low + bias
+                    high = high + bias
+                records.append({
+                    'layer': layer,
+                    'input_shape': input_shape,
+                    'output_shape': tuple(low.shape),
+                    'weight': weight,
+                    'bias': bias,
+                })
+                continue
+
+            if isinstance(layer, torch.nn.Conv2d):
+                weight = layer.weight.detach().to(device=device, dtype=dtype)
+                bias = None if layer.bias is None else layer.bias.detach().to(
+                    device=device, dtype=dtype
+                )
+                weight_pos = weight.clamp(min=0)
+                weight_neg = weight.clamp(max=0)
+                old_low, old_high = low, high
+                low = F.conv2d(
+                    old_low,
+                    weight_pos,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups,
+                ) + F.conv2d(
+                    old_high,
+                    weight_neg,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups,
+                )
+                high = F.conv2d(
+                    old_high,
+                    weight_pos,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups,
+                ) + F.conv2d(
+                    old_low,
+                    weight_neg,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    dilation=layer.dilation,
+                    groups=layer.groups,
+                )
+                if bias is not None:
+                    bias_img = bias.view(1, -1, 1, 1)
+                    low = low + bias_img
+                    high = high + bias_img
+                records.append({
+                    'layer': layer,
+                    'input_shape': input_shape,
+                    'output_shape': tuple(low.shape),
+                    'weight': weight,
+                    'bias': bias,
+                })
+                continue
+
+            if isinstance(layer, torch.nn.ReLU):
+                pre_low = low.clone()
+                pre_high = high.clone()
+                low = torch.clamp(pre_low, min=0)
+                high = torch.clamp(pre_high, min=0)
+                records.append({
+                    'layer': layer,
+                    'input_shape': input_shape,
+                    'output_shape': tuple(low.shape),
+                    'pre_low': pre_low,
+                    'pre_high': pre_high,
+                })
+                continue
+
+            raise NotImplementedError(
+                'Unsupported layer type in CROWN forward pass: {}'.format(
+                    type(layer)
+                )
+            )
+
+    output_low = low.reshape(-1)
+    output_high = high.reshape(-1)
+    output_size = output_low.numel()
+    if not (0 <= true_label < output_size):
+        raise ValueError('true_label is outside the output dimension.')
+
+    relu_records = [
+        record for record in records
+        if isinstance(record['layer'], torch.nn.ReLU)
+    ]
+
+    def alpha_candidate(kind):
+        values = []
+        for record in relu_records:
+            l = record['pre_low'].squeeze(0)
+            u = record['pre_high'].squeeze(0)
+            neg = u <= 0
+            pos = l >= 0
+            unstable = (~neg) & (~pos)
+            denominator = (u - l).clamp_min(torch.finfo(dtype).eps)
+            upper_slope = torch.where(unstable, u / denominator, torch.zeros_like(u))
+
+            if kind == 'heuristic':
+                unstable_value = torch.where(
+                    u >= -l, torch.ones_like(u), torch.zeros_like(u)
+                )
+            elif kind == 'half':
+                unstable_value = torch.full_like(u, 0.5)
+            elif kind == 'secant':
+                unstable_value = upper_slope
+            else:
+                raise ValueError('Unknown alpha candidate: {}'.format(kind))
+
+            alpha = torch.where(
+                pos,
+                torch.ones_like(u),
+                torch.where(unstable, unstable_value, torch.zeros_like(u)),
+            )
+            values.append(alpha)
+        return values
+
+    def theta_from_alpha(alpha_values):
+        params = []
+        for alpha in alpha_values:
+            safe_alpha = alpha.detach().clamp(PARAM_EPS, 1.0 - PARAM_EPS)
+            theta = torch.log(safe_alpha) - torch.log1p(-safe_alpha)
+            params.append(torch.nn.Parameter(theta))
+        return params
+
+    def alpha_from_theta(theta_params):
+        return [torch.sigmoid(theta) for theta in theta_params]
+
+    def crown_margin_lower(target_label, alpha_values):
+        """Return a differentiable lower bound on f_true - f_target."""
+        coefficient = torch.zeros(
+            1, output_size, device=device, dtype=dtype
+        )
+        coefficient[0, true_label] = 1.0
+        coefficient[0, target_label] = -1.0
+        bound_bias = torch.zeros(1, device=device, dtype=dtype)
+        relu_index = len(relu_records) - 1
+
+        for record in reversed(records):
+            layer = record['layer']
+
+            if isinstance(layer, torch.nn.Linear):
+                weight = record['weight']
+                bias = record['bias']
+                coefficient = coefficient.reshape(coefficient.size(0), -1)
+                if bias is not None:
+                    bound_bias = bound_bias + coefficient @ bias
+                coefficient = coefficient @ weight
+                continue
+
+            if isinstance(layer, torch.nn.Flatten):
+                coefficient = coefficient.reshape(
+                    (coefficient.size(0),) + record['input_shape'][1:]
+                )
+                continue
+
+            if isinstance(layer, torch.nn.ReLU):
+                l = record['pre_low'].squeeze(0)
+                u = record['pre_high'].squeeze(0)
+                alpha = alpha_values[relu_index]
+                relu_index -= 1
+
+                neg = u <= 0
+                pos = l >= 0
+                unstable = (~neg) & (~pos)
+                zeros = torch.zeros_like(u)
+                ones = torch.ones_like(u)
+
+                lower_slope = torch.where(
+                    pos,
+                    ones,
+                    torch.where(unstable, alpha, zeros),
+                )
+
+                denominator = torch.where(
+                    unstable,
+                    (u - l).clamp_min(torch.finfo(dtype).eps),
+                    torch.ones_like(u),
+                )
+                unstable_upper_slope = torch.where(
+                    unstable, u / denominator, zeros
+                )
+                upper_slope = torch.where(
+                    pos,
+                    ones,
+                    torch.where(unstable, unstable_upper_slope, zeros),
+                )
+                upper_intercept = torch.where(
+                    unstable,
+                    -l * unstable_upper_slope,
+                    zeros,
+                )
+
+                positive_coefficient = coefficient.clamp(min=0)
+                negative_coefficient = coefficient.clamp(max=0)
+                bound_bias = bound_bias + _sum_nonbatch(
+                    negative_coefficient * upper_intercept.unsqueeze(0)
+                )
+                coefficient = (
+                    positive_coefficient * lower_slope.unsqueeze(0)
+                    + negative_coefficient * upper_slope.unsqueeze(0)
+                )
+                continue
+
+            if isinstance(layer, torch.nn.Conv2d):
+                weight = record['weight']
+                bias = record['bias']
+                if coefficient.dim() != 4:
+                    raise RuntimeError(
+                        'Conv2d backward coefficient must be four-dimensional.'
+                    )
+                if bias is not None:
+                    bound_bias = bound_bias + _sum_nonbatch(
+                        coefficient * bias.view(1, -1, 1, 1)
+                    )
+
+                stride_h, stride_w = _pair(layer.stride)
+                pad_h, pad_w = _pair(layer.padding)
+                dil_h, dil_w = _pair(layer.dilation)
+                kernel_h, kernel_w = _pair(layer.kernel_size)
+                input_h, input_w = record['input_shape'][-2:]
+                output_h, output_w = coefficient.shape[-2:]
+
+                base_h = (
+                    (output_h - 1) * stride_h
+                    - 2 * pad_h
+                    + dil_h * (kernel_h - 1)
+                    + 1
+                )
+                base_w = (
+                    (output_w - 1) * stride_w
+                    - 2 * pad_w
+                    + dil_w * (kernel_w - 1)
+                    + 1
+                )
+                output_padding_h = input_h - base_h
+                output_padding_w = input_w - base_w
+                if not (0 <= output_padding_h < stride_h):
+                    raise RuntimeError(
+                        'Invalid conv_transpose2d output_padding height: {}'.format(
+                            output_padding_h
+                        )
+                    )
+                if not (0 <= output_padding_w < stride_w):
+                    raise RuntimeError(
+                        'Invalid conv_transpose2d output_padding width: {}'.format(
+                            output_padding_w
+                        )
+                    )
+
+                coefficient = F.conv_transpose2d(
+                    coefficient,
+                    weight,
+                    bias=None,
+                    stride=layer.stride,
+                    padding=layer.padding,
+                    output_padding=(output_padding_h, output_padding_w),
+                    groups=layer.groups,
+                    dilation=layer.dilation,
+                )
+                continue
+
+            if isinstance(layer, Normalization):
+                mean = record['mean']
+                sigma = record['sigma']
+                bound_bias = bound_bias + _sum_nonbatch(
+                    coefficient * (-mean / sigma)
+                )
+                coefficient = coefficient / sigma
+                continue
+
+            raise NotImplementedError(
+                'Unsupported layer type in CROWN backward pass: {}'.format(
+                    type(layer)
+                )
+            )
+
+        if relu_index != -1:
+            raise RuntimeError('Not all ReLU slope tensors were consumed.')
+
+        coefficient_pos = coefficient.clamp(min=0)
+        coefficient_neg = coefficient.clamp(max=0)
+        lower = bound_bias + _sum_nonbatch(
+            coefficient_pos * input_low + coefficient_neg * input_high
+        )
+        return lower[0]
+
+    # Evaluate the hardest pairwise margins first. This often saves substantial
+    # time on genuinely non-robust or currently unprovable cases.
+    target_labels = [label for label in range(output_size) if label != true_label]
+    target_labels.sort(
+        key=lambda label: float(output_low[true_label] - output_high[label])
+    )
+
+    candidate_names = ('heuristic', 'half', 'secant')
+    candidate_sets = [alpha_candidate(name) for name in candidate_names]
+
+    for target_label in target_labels:
+        if time.perf_counter() >= deadline:
+            return False
+
+        # The direct IBP margin is already a sound proof when positive.
+        ibp_margin = output_low[true_label] - output_high[target_label]
+        if float(ibp_margin) > CERT_TOL:
+            continue
+
+        best_margin_value = -float('inf')
+        best_alpha_values = None
+
+        with torch.no_grad():
+            for candidate in candidate_sets:
+                margin = crown_margin_lower(target_label, candidate)
+                value = float(margin)
+                if value > best_margin_value:
+                    best_margin_value = value
+                    best_alpha_values = [a.detach().clone() for a in candidate]
+                if value > CERT_TOL:
+                    break
+
+        if best_margin_value > CERT_TOL:
+            continue
+        if best_alpha_values is None or not relu_records:
+            return False
+
+        theta_params = theta_from_alpha(best_alpha_values)
+        optimizer = torch.optim.Adam(theta_params, lr=CROWN_LR)
+        best_theta_state = [theta.detach().clone() for theta in theta_params]
+
+        with torch.enable_grad():
+            for step in range(CROWN_OPT_STEPS):
+                if time.perf_counter() >= deadline:
+                    break
+
+                optimizer.zero_grad(set_to_none=True)
+                current_alphas = alpha_from_theta(theta_params)
+                margin = crown_margin_lower(target_label, current_alphas)
+                margin_value = float(margin.detach())
+
+                if margin_value > best_margin_value:
+                    best_margin_value = margin_value
+                    best_theta_state = [
+                        theta.detach().clone() for theta in theta_params
+                    ]
+                if margin_value > CERT_TOL:
+                    break
+                if not torch.isfinite(margin):
+                    break
+
+                (-margin).backward()
+                optimizer.step()
+
+                # A small learning-rate drop helps settle near a useful corner
+                # without making the first half of optimization too timid.
+                if step == CROWN_OPT_STEPS // 2:
+                    for group in optimizer.param_groups:
+                        group['lr'] *= 0.35
+
+        if best_margin_value <= CERT_TOL:
+            with torch.no_grad():
+                restored_alphas = [
+                    torch.sigmoid(theta) for theta in best_theta_state
+                ]
+                restored_margin = crown_margin_lower(
+                    target_label, restored_alphas
+                )
+                best_margin_value = max(
+                    best_margin_value, float(restored_margin)
+                )
+
+        if best_margin_value <= CERT_TOL:
+            return False
+
+    return True
+
+
+def analyze(model, x, eps, true_label):
+    """
+    Preserve the existing 64%-level forward hybrid verifier as the first pass.
+    For convolutional cases that it cannot prove, use target-specific CROWN
+    backward substitution with optimized alpha slopes as a fallback.
+    """
+    start_time = time.perf_counter()
+    forward_result = _analyze_forward_hybrid(model, x, eps, true_label)
+    if forward_result:
+        return True
+
+    has_convolution = any(
+        isinstance(layer, torch.nn.Conv2d)
+        for layer in model.layers.children()
+    )
+    if not has_convolution:
+        return False
+
+    # Leave a safety margin under the project's three-minute limit. If the
+    # original forward pass was already very slow, do not risk timing out.
+    elapsed = time.perf_counter() - start_time
+    remaining_budget = 168.0 - elapsed
+    if remaining_budget < 5.0:
+        return False
+
+    return _analyze_crown_backward(
+        model,
+        x,
+        eps,
+        true_label,
+        time_budget_seconds=remaining_budget,
+    )
 
 def load_network(net_name):
     if net_name == 'fc1':
