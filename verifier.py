@@ -13,164 +13,316 @@ NETWORK_NAMES = ['fc1', 'fc2', 'fc3', 'fc4', 'fc5', 'fc6', 'fc7', 'conv1', 'conv
 
 def analyze(model, x, eps, true_label):
     """
-    DeepPoly 风格的鲁棒性验证器（线性/仿射界传播版本)。
+    使用可学习 ReLU lower-bound slope 的 DeepPoly 风格验证器。
 
-    核心区别（相对于纯区间传播 low/high):
-    对网络中的每一个神经元 z,我们不再只维护两个数字 [low, high],
-    而是维护两条关于"原始输入像素"x 的仿射（线性)表达式:
+    对不稳定 ReLU（l < 0 < u），使用：
 
-        A_low @ x + b_low  <=  z  <=  A_high @ x + b_high      对所有 x in [x_l, x_u]
+        alpha * z <= ReLU(z),    alpha in [0, 1]
 
-    这样在每一层做传播时,Linear / Conv2d 的线性组合是"精确"的
-    （仿射函数的正/负系数分解组合,不会引入额外误差);
-    只有在 ReLU 处,才需要引入近似（这也是 DeepPoly 唯一近似的地方)。
-    最后再用输入区间对最终的仿射表达式做一次区间求值,得到具体数值下界/上界。
+    其中 alpha 不再固定为 0/1，而是针对当前测试样本，用 Adam 最大化
+    最差分类 margin：
 
-    注意:这里选择把仿射系数直接维护到"原始输入"（而不是像标准 DeepPoly
-    论文那样只维护到"上一层",再在需要时反向代入 back-substitution)。
-    这样实现更直接、更不容易出错,数学上同样是 sound 的,
-    只是理论上界可能比完整 back-substitution 版本略松（对 MNIST 这种规模的网络影响很小)。
+        min_{j != y} (lower(logit_y) - upper(logit_j))
+
+    每次传播对于任意 alpha in [0, 1] 都保持 sound；优化只是在 sound 的
+    松弛族中寻找更紧的一组 alpha。
     """
+    # 这些值可以在开发集上调整。CPU 时间紧时可把 OPT_STEPS 降到 10~15。
+    OPT_STEPS = 25
+    OPT_LR = 5e-2
+    OPT_TEMPERATURE = 1.0
+    OPT_INIT_EPS = 5e-2
+    CERT_TOL = 1e-8
+
+    model.eval()
     device = x.device
-    x_flat = x.reshape(-1)
-    D = x_flat.numel()
-    x_l = torch.clamp(x_flat - eps, 0.0, 1.0)
-    x_u = torch.clamp(x_flat + eps, 0.0, 1.0)
+    dtype = x.dtype
 
-    # 初始状态:输入自己相对自己的仿射表达式就是恒等映射 A=I, b=0
-    A_low = torch.eye(D, device=device)
-    A_high = torch.eye(D, device=device)
-    b_low = torch.zeros(D, device=device)
-    b_high = torch.zeros(D, device=device)
+    x_flat = x.detach().reshape(-1)
+    input_dim = x_flat.numel()
+    original_x_l = torch.clamp(x_flat - eps, 0.0, 1.0)
+    original_x_u = torch.clamp(x_flat + eps, 0.0, 1.0)
 
-    # 记录当前特征图的空间形状（供 Conv2d 使用),x 的原始 shape 例如 (1,28,28)
-    cur_shape = tuple(x.shape[-3:]) if x.dim() >= 3 else None
+    other_labels = torch.tensor(
+        [label for label in range(10) if label != true_label],
+        device=device,
+        dtype=torch.long,
+    )
 
-    def concrete_bounds(A_low, b_low, A_high, b_high):
-        """把仿射表达式对输入区间 [x_l, x_u] 做区间求值,得到具体数值 low/high"""
-        Al_pos, Al_neg = A_low.clamp(min=0), A_low.clamp(max=0)
-        Au_pos, Au_neg = A_high.clamp(min=0), A_high.clamp(max=0)
-        low = Al_pos @ x_l + Al_neg @ x_u + b_low
-        high = Au_pos @ x_u + Au_neg @ x_l + b_high
+    def concrete_bounds(A_low, b_low, A_high, b_high, x_l, x_u):
+        """在输入 box [x_l, x_u] 上求仿射下界/上界的具体值。"""
+        A_low_pos = A_low.clamp(min=0)
+        A_low_neg = A_low.clamp(max=0)
+        A_high_pos = A_high.clamp(min=0)
+        A_high_neg = A_high.clamp(max=0)
+
+        low = A_low_pos @ x_l + A_low_neg @ x_u + b_low
+        high = A_high_pos @ x_u + A_high_neg @ x_l + b_high
         return low, high
 
-    for layer in model.layers.children():
-        if isinstance(layer, Normalization):
-            mean = layer.mean.view(-1)
-            sigma = layer.sigma.view(-1)
+    def propagate(alpha_params=None, initialize_alpha=False):
+        """
+        传播一次并返回 9 个分类 margin 下界。
 
-            x_l = (x_l - mean) / sigma
-            x_u = (x_u - mean) / sigma
-            continue
-        # ---------------- Linear 层:精确的仿射组合 ----------------
-        if isinstance(layer, torch.nn.Linear):
-            W, b = layer.weight, layer.bias
-            W_pos, W_neg = W.clamp(min=0), W.clamp(max=0)
+        initialize_alpha=True 时，为每一个 ReLU 层建立一个与该层神经元数
+        相同的可学习向量。稳定 ReLU 的 alpha 不会被使用，也不会产生梯度；
+        使用整层向量可以避免优化过程中 cross mask 改变导致索引错位。
+        """
+        if alpha_params is None:
+            alpha_params = []
 
-            new_A_low = W_pos @ A_low + W_neg @ A_high
-            new_A_high = W_pos @ A_high + W_neg @ A_low
-            new_b_low = W_pos @ b_low + W_neg @ b_high
-            new_b_high = W_pos @ b_high + W_neg @ b_low
-            if b is not None:
-                new_b_low = new_b_low + b
-                new_b_high = new_b_high + b
+        x_l = original_x_l
+        x_u = original_x_u
 
-            A_low, A_high, b_low, b_high = new_A_low, new_A_high, new_b_low, new_b_high
+        A_low = torch.eye(input_dim, device=device, dtype=dtype)
+        A_high = torch.eye(input_dim, device=device, dtype=dtype)
+        b_low = torch.zeros(input_dim, device=device, dtype=dtype)
+        b_high = torch.zeros(input_dim, device=device, dtype=dtype)
 
-        # ---------------- Conv2d 层:把系数矩阵当成"批量图像"做卷积 ----------------
-        elif isinstance(layer, torch.nn.Conv2d):
-            W, b = layer.weight, layer.bias
-            C_in, H_in, W_in = cur_shape
-            W_pos, W_neg = W.clamp(min=0), W.clamp(max=0)
+        cur_shape = tuple(x.shape[-3:]) if x.dim() >= 3 else None
+        relu_id = 0
 
-            def conv_c(Wt, A):
-                # A: [N_prev, D] -> 把 D 维当作 batch,每个通道图像做卷积
-                A_img = A.t().reshape(D, C_in, H_in, W_in)
-                return F.conv2d(
-                    A_img, Wt, None,
-                    stride=layer.stride, padding=layer.padding,
-                    dilation=layer.dilation, groups=layer.groups,
-                )  # [D, C_out, H_out, W_out]
+        for layer in model.layers.children():
+            if isinstance(layer, Normalization):
+                # 标准差为正，因此区间端点顺序不变。
+                mean = layer.mean.detach().to(device=device, dtype=dtype).view(-1)
+                sigma = layer.sigma.detach().to(device=device, dtype=dtype).view(-1)
+                x_l = (x_l - mean) / sigma
+                x_u = (x_u - mean) / sigma
+                continue
 
-            low_img = conv_c(W_pos, A_low) + conv_c(W_neg, A_high)
-            high_img = conv_c(W_pos, A_high) + conv_c(W_neg, A_low)
-            C_out, H_out, W_out = low_img.shape[1:]
-            new_A_low = low_img.reshape(D, -1).t()
-            new_A_high = high_img.reshape(D, -1).t()
+            if isinstance(layer, torch.nn.Linear):
+                # detach 网络权重，使 autograd 只计算 alpha 的梯度。
+                W = layer.weight.detach().to(device=device, dtype=dtype)
+                b = None if layer.bias is None else layer.bias.detach().to(device=device, dtype=dtype)
+                W_pos = W.clamp(min=0)
+                W_neg = W.clamp(max=0)
 
-            # 常数项 b_low/b_high 本身也是一张"图像"（每个像素一个常数),同样做卷积
-            def conv_b(Wt, bvec):
-                b_img = bvec.reshape(1, C_in, H_in, W_in)
-                return F.conv2d(
-                    b_img, Wt, None,
-                    stride=layer.stride, padding=layer.padding,
-                    dilation=layer.dilation, groups=layer.groups,
-                ).reshape(-1)
+                new_A_low = W_pos @ A_low + W_neg @ A_high
+                new_A_high = W_pos @ A_high + W_neg @ A_low
+                new_b_low = W_pos @ b_low + W_neg @ b_high
+                new_b_high = W_pos @ b_high + W_neg @ b_low
 
-            new_b_low = conv_b(W_pos, b_low) + conv_b(W_neg, b_high)
-            new_b_high = conv_b(W_pos, b_high) + conv_b(W_neg, b_low)
-            if b is not None:
-                bias_flat = b.view(-1, 1, 1).expand(C_out, H_out, W_out).reshape(-1)
-                new_b_low = new_b_low + bias_flat
-                new_b_high = new_b_high + bias_flat
+                if b is not None:
+                    new_b_low = new_b_low + b
+                    new_b_high = new_b_high + b
 
-            A_low, A_high, b_low, b_high = new_A_low, new_A_high, new_b_low, new_b_high
-            cur_shape = (C_out, H_out, W_out)
+                A_low, A_high = new_A_low, new_A_high
+                b_low, b_high = new_b_low, new_b_high
+                continue
 
-        elif isinstance(layer, torch.nn.Flatten):
-            continue  # 不改变仿射表达式,只是形状记账（下一层若是 Linear 无需额外处理)
+            if isinstance(layer, torch.nn.Conv2d):
+                if cur_shape is None:
+                    raise RuntimeError('Conv2d encountered without a valid feature-map shape.')
 
-        # ---------------- ReLU 层:DeepPoly 的核心近似发生在这里 ----------------
-        elif isinstance(layer, torch.nn.ReLU):
-            l, u = concrete_bounds(A_low, b_low, A_high, b_high)
+                W = layer.weight.detach().to(device=device, dtype=dtype)
+                b = None if layer.bias is None else layer.bias.detach().to(device=device, dtype=dtype)
+                C_in, H_in, W_in = cur_shape
+                W_pos = W.clamp(min=0)
+                W_neg = W.clamp(max=0)
 
-            new_A_low = A_low.clone()
-            new_A_high = A_high.clone()
-            new_b_low = b_low.clone()
-            new_b_high = b_high.clone()
+                def conv_coeff(weight, coeff):
+                    # coeff: [N_prev, input_dim]
+                    # 将 input_dim 当作 batch，一次卷积所有输入基向量的系数图。
+                    coeff_img = coeff.t().reshape(input_dim, C_in, H_in, W_in)
+                    return F.conv2d(
+                        coeff_img,
+                        weight,
+                        bias=None,
+                        stride=layer.stride,
+                        padding=layer.padding,
+                        dilation=layer.dilation,
+                        groups=layer.groups,
+                    )
 
-            # 情况一:恒为负 (u <= 0) -> 输出恒为 0
-            neg_mask = u <= 0
-            new_A_low[neg_mask] = 0
-            new_A_high[neg_mask] = 0
-            new_b_low[neg_mask] = 0
-            new_b_high[neg_mask] = 0
+                low_img = conv_coeff(W_pos, A_low) + conv_coeff(W_neg, A_high)
+                high_img = conv_coeff(W_pos, A_high) + conv_coeff(W_neg, A_low)
+                C_out, H_out, W_out = low_img.shape[1:]
 
-            # 情况二:恒为正 (l >= 0) -> ReLU 是恒等映射,系数不变（已经 clone 保留)
+                new_A_low = low_img.reshape(input_dim, -1).t()
+                new_A_high = high_img.reshape(input_dim, -1).t()
 
-            # 情况三:跨越 0 (l < 0 < u) -> 需要线性松弛
-            cross_mask = (l < 0) & (u > 0)
-            if cross_mask.any():
-                idx = cross_mask.nonzero(as_tuple=True)[0]
-                l_c, u_c = l[idx], u[idx]
+                def conv_bias(weight, bias_vector):
+                    bias_img = bias_vector.reshape(1, C_in, H_in, W_in)
+                    return F.conv2d(
+                        bias_img,
+                        weight,
+                        bias=None,
+                        stride=layer.stride,
+                        padding=layer.padding,
+                        dilation=layer.dilation,
+                        groups=layer.groups,
+                    ).reshape(-1)
 
-                # 上界:唯一穿过 (l,0) 和 (u,u) 两点的直线,斜率 u/(u-l)
-                slope = u_c / (u_c - l_c)
-                new_A_high[idx] = slope.unsqueeze(1) * A_high[idx]
-                new_b_high[idx] = slope * b_high[idx] - slope * l_c
+                new_b_low = conv_bias(W_pos, b_low) + conv_bias(W_neg, b_high)
+                new_b_high = conv_bias(W_pos, b_high) + conv_bias(W_neg, b_low)
 
-                # 下界:在 y=0 和 y=z 两条候选直线中选面积更小的一条
-                # （标准 DeepPoly 的启发式;如果想要更紧的界,可以把这个 0/1
-                #  换成一个可学习的 slope in [0,1],用梯度上升去优化,
-                #  这就是课程提到的 "optimized ReLU relaxation slope")
-                use_identity = u_c >= -l_c
-                zero_idx = idx[~use_identity]
-                new_A_low[zero_idx] = 0
-                new_b_low[zero_idx] = 0
-                # use_identity 为 True 的部分保持 slope=1,即沿用原来的 A_low/b_low
+                if b is not None:
+                    expanded_bias = b.view(-1, 1, 1).expand(C_out, H_out, W_out).reshape(-1)
+                    new_b_low = new_b_low + expanded_bias
+                    new_b_high = new_b_high + expanded_bias
 
-            A_low, A_high, b_low, b_high = new_A_low, new_A_high, new_b_low, new_b_high
+                A_low, A_high = new_A_low, new_A_high
+                b_low, b_high = new_b_low, new_b_high
+                cur_shape = (C_out, H_out, W_out)
+                continue
 
-        else:
-            raise NotImplementedError("Unsupported layer type: %s" % type(layer))
+            if isinstance(layer, torch.nn.Flatten):
+                # 系数本来就是 flatten 后的二维矩阵，只需保留 cur_shape 供此前卷积使用。
+                continue
 
-    # 最终输出层:对仿射表达式做一次区间求值,得到具体的 logits 下界/上界
-    low, high = concrete_bounds(A_low, b_low, A_high, b_high)
+            if isinstance(layer, torch.nn.ReLU):
+                l, u = concrete_bounds(A_low, b_low, A_high, b_high, x_l, x_u)
+                neuron_count = l.numel()
 
-    true_low = low[true_label]
-    other_upper = high.clone()
-    other_upper[true_label] = -float("inf")
-    return bool(true_low > other_upper.max())
+                neg_mask = u <= 0
+                pos_mask = l >= 0
+                cross_mask = (~neg_mask) & (~pos_mask)
+
+                if initialize_alpha:
+                    # 使用原 DeepPoly 0/1 heuristic 作为优化起点。
+                    # 为整层建立参数，避免后续 cross_mask 改变时参数索引错位。
+                    initial_alpha = torch.where(
+                        u >= -l,
+                        torch.ones_like(l),
+                        torch.zeros_like(l),
+                    )
+                    alpha_params.append(
+                        torch.nn.Parameter(initial_alpha.detach().clone())
+                    )
+
+                if relu_id >= len(alpha_params):
+                    raise RuntimeError(
+                        'Missing alpha parameters for ReLU layer {}'.format(relu_id)
+                    )
+
+                alpha = alpha_params[relu_id]
+                if alpha.numel() != neuron_count:
+                    raise RuntimeError(
+                        'Alpha size mismatch at ReLU layer {}: expected {}, got {}'.format(
+                            relu_id, neuron_count, alpha.numel()
+                        )
+                    )
+                relu_id += 1
+
+                # 即使调用方忘记投影，也保证传播中实际 slope 始终在 [0,1]。
+                alpha_safe = alpha.clamp(0.0, 1.0)
+
+                zeros = torch.zeros_like(l)
+                ones = torch.ones_like(l)
+
+                # Lower relaxation:
+                #   stable negative -> 0
+                #   stable positive -> identity
+                #   unstable       -> alpha * z
+                lower_scale = torch.where(
+                    pos_mask,
+                    ones,
+                    torch.where(cross_mask, alpha_safe, zeros),
+                )
+                A_low = lower_scale.unsqueeze(1) * A_low
+                b_low = lower_scale * b_low
+
+                # Upper relaxation for unstable ReLU:
+                #   ReLU(z) <= lambda * z - lambda * l,
+                #   lambda = u / (u - l)
+                denominator = (u - l).clamp_min(torch.finfo(dtype).eps)
+                upper_slope_cross = u / denominator
+                upper_scale = torch.where(
+                    pos_mask,
+                    ones,
+                    torch.where(cross_mask, upper_slope_cross, zeros),
+                )
+                upper_intercept = torch.where(
+                    cross_mask,
+                    -upper_slope_cross * l,
+                    zeros,
+                )
+                A_high = upper_scale.unsqueeze(1) * A_high
+                b_high = upper_scale * b_high + upper_intercept
+                continue
+
+            raise NotImplementedError('Unsupported layer type: {}'.format(type(layer)))
+
+        low, high = concrete_bounds(A_low, b_low, A_high, b_high, x_l, x_u)
+        margins = low[true_label] - high.index_select(0, other_labels)
+        return margins, alpha_params
+
+    # 第一次传播：建立 alpha，并以原来的 0/1 heuristic 初始化。
+    alpha_params = []
+    with torch.enable_grad():
+        initial_margins, alpha_params = propagate(
+            alpha_params=alpha_params,
+            initialize_alpha=True,
+        )
+
+    initial_min_margin = float(initial_margins.min().detach())
+    if initial_min_margin > CERT_TOL:
+        return True
+
+    # 没有 ReLU 时不存在可优化参数。
+    if not alpha_params:
+        return False
+
+    optimizer = torch.optim.Adam(alpha_params, lr=OPT_LR)
+
+    best_min_margin = initial_min_margin
+    best_alpha = [alpha.detach().clone() for alpha in alpha_params]
+
+    # 0/1 是很好的离散 heuristic，但从边界直接做投影优化容易被卡住。
+    # 先保存它作为候选最优解，再把优化起点轻微移入 (0,1)。
+    with torch.no_grad():
+        for alpha in alpha_params:
+            alpha.mul_(1.0 - 2.0 * OPT_INIT_EPS).add_(OPT_INIT_EPS)
+
+    with torch.enable_grad():
+        for _ in range(OPT_STEPS):
+            optimizer.zero_grad(set_to_none=True)
+
+            margins, _ = propagate(alpha_params=alpha_params)
+            exact_min_margin = margins.min()
+            current_value = float(exact_min_margin.detach())
+
+            if current_value > best_min_margin:
+                best_min_margin = current_value
+                best_alpha = [alpha.detach().clone() for alpha in alpha_params]
+
+            # 已经找到严格为正的所有分类 margin，可以立即返回。
+            if current_value > CERT_TOL:
+                return True
+
+            # smooth max(-margin)，等价于平滑地最大化最差 margin；
+            # 相比直接 -margins.min()，切换最差类别时梯度通常更稳定。
+            loss = OPT_TEMPERATURE * torch.logsumexp(
+                -margins / OPT_TEMPERATURE,
+                dim=0,
+            )
+
+            if not torch.isfinite(loss):
+                break
+
+            loss.backward()
+            optimizer.step()
+
+            # Projected Adam：保证每个 slope 都位于 sound 区间 [0,1]。
+            with torch.no_grad():
+                for alpha in alpha_params:
+                    alpha.clamp_(0.0, 1.0)
+
+    # 检查最后一次 optimizer 更新后的 alpha（循环内部尚未 forward 这一状态）。
+    with torch.no_grad():
+        final_margins, _ = propagate(alpha_params=alpha_params)
+        final_min_margin = float(final_margins.min())
+        if final_min_margin > best_min_margin:
+            best_min_margin = final_min_margin
+            best_alpha = [alpha.detach().clone() for alpha in alpha_params]
+
+        # 恢复整个优化过程中最好的 slope，而不是盲目采用最后一步。
+        for alpha, saved_alpha in zip(alpha_params, best_alpha):
+            alpha.copy_(saved_alpha)
+
+        certified_margins, _ = propagate(alpha_params=alpha_params)
+        return bool(certified_margins.min().item() > CERT_TOL)
 
 def load_network(net_name):
     if net_name == 'fc1':
