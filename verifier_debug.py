@@ -1,77 +1,3 @@
-# =============================================================================
-# FUTURE DIRECTIONS — post-course notes on how to push past the current 64%
-# =============================================================================
-#
-# CURRENT STATE (diagnosed on the 50 example test cases, no soundness violations):
-#   - Hybrid IBP + affine (DeepPoly-style) verifier with optimized per-neuron
-#     ReLU lower-bound slopes (alpha), per-target-class optimization, and a
-#     CROWN-backward fallback for conv cases.
-#   - 64% pass rate, stable across repeated runs and across much larger
-#     optimizer step budgets (confirmed: raising step ceilings 15x produced
-#     nearly identical margins — NOT a search/optimization problem).
-#   - Root cause of the remaining 18 misses: single-neuron independent ReLU
-#     relaxation has a provable precision ceiling (see Salman, Yang, Zhang,
-#     Hsieh, Zhang, "A Convex Relaxation Barrier to Tight Robustness
-#     Verification of Neural Networks", NeurIPS 2019). Optimizing the slope
-#     alpha only moves you to the best point *within* that ceiling — it
-#     cannot break through it.
-#
-# DIAGNOSED FAILURE MODES (useful context if picking this back up):
-#   1. "Frozen margin" cases (e.g. fc4/img1, fc4/img4, fc7/img0 eps=0.5):
-#      at each ReLU we take l = max(affine_l, box_l), u = min(affine_u, box_u).
-#      When plain IBP (box) wins this max/min almost everywhere, the final
-#      margin stops depending on alpha at all -> zero gradient, no amount of
-#      optimization steps helps. Most common with large eps / deep networks
-#      where intervals blow up.
-#   2. The CROWN-backward fallback never certified a single extra case in
-#      diagnostics, because it computes per-layer pre-activation bounds via
-#      *plain* forward IBP (no affine tightening at all) — its optimization
-#      starting point is already looser than what the forward hybrid pass
-#      achieves after optimization, so alpha-tuning on top of it can't win.
-#      (Fixable in principle by tightening its intermediate bounds the same
-#      way the forward pass does, but that's a real rewrite, not a patch.)
-#
-# DIRECTION 1 — Multi-neuron joint relaxation (moves the ceiling itself)
-#   - k-ReLU (Singh et al., ICML 2019): group 2-4 ReLU neurons at a time,
-#     solve a small LP/enumerate vertices to get a joint convex relaxation
-#     instead of treating each neuron independently. Recovers some of the
-#     correlation that single-neuron relaxations throw away.
-#   - PRIMA (Müller et al., PLDI 2022): generalizes k-ReLU to larger groups
-#     and other nonlinearities. Represents the current state of the art for
-#     this family of methods.
-#   - Implementation cost estimate: ~3-4 weeks for a working (not
-#     paper-quality) version — LP solving (scipy.optimize.linprog) for
-#     neuron groups, integrating group-wise propagation into the existing
-#     layer-by-layer framework, and a lot of numerical-stability tuning.
-#
-# DIRECTION 2 — Branch and bound (case-split on individual unstable neurons)
-#   - For neurons whose margin ends up *close* to 0 after alpha optimization
-#     (e.g. fc3/img0 class 6 ended at -0.4974, conv2/img4 class 0 ended at
-#     -0.73), split into two sub-problems: neuron forced negative / neuron
-#     forced positive, verify both, combine. Eliminates the single-neuron
-#     approximation for that neuron entirely, at the cost of 2x work per split.
-#   - Bunel et al. 2018 for the original idea; alpha-beta-CROWN (Wang et al.,
-#     NeurIPS 2021) combines this with optimized slopes and is the strongest
-#     open-source reference implementation to *read* (not to integrate —
-#     project rules require self-written code only).
-#   - Implementation cost estimate: 1-2 days for a crude prototype (reuse the
-#     existing `propagate` function with a "force this neuron's sign" switch),
-#     another 3-5 days to make branch selection reasonably automatic.
-#   - Expected payoff: rescues "close but not quite" cases; does nothing for
-#     cases with large margin gaps (fc7/img0, conv3 series all sit at -20 to
-#     -150 — branch and bound on 1-2 neurons won't close a gap that size).
-#
-# WHAT DOESN'T HELP (confirmed empirically, don't re-try without changing the
-# underlying method):
-#   - More optimizer steps / higher step ceilings (tested up to 360, no change).
-#   - Random-restart re-initialization of alpha (converges to ~same value
-#     regardless of starting point on the frozen cases).
-#   - The reset_to_interval second pass (0 additional certifications across
-#     two full diagnostic runs, but 15-140+ seconds cost per conv case).
-#   - The CROWN-backward fallback as currently implemented (see failure mode
-#     #2 above).
-# =============================================================================
-
 import argparse
 import os
 import time
@@ -85,35 +11,23 @@ INPUT_SIZE = 28
 NETWORK_NAMES = ['fc1', 'fc2', 'fc3', 'fc4', 'fc5', 'fc6', 'fc7', 'conv1', 'conv2', 'conv3']
 
 
-
-def _analyze_forward_hybrid(model, x, eps, true_label):
+def _analyze_forward_hybrid(model, x, eps, true_label, debug=False, tag=""):
     """
     Hybrid IBP + affine-bound verifier with optimized ReLU slopes.
-
-    Main changes compared with the previous version:
-      1. Keep both symbolic affine bounds and concrete IBP bounds.
-      2. At every ReLU, intersect the two pre-activation intervals before
-         constructing the relaxation. This keeps the useful fact ReLU(z) >= 0.
-      3. Replace separate output-logit bounds with direct pairwise margins:
-             f_true(x) - f_other(x) > 0.
-      4. First optimize one shared set of slopes; then optimize a separate set
-         for each still-unproved target class. Different sound relaxations may
-         be used to prove different pairwise inequalities.
-
-    For every unstable ReLU l < 0 < u, the symbolic lower relaxation is
-
-        ReLU(z) >= alpha * z,   alpha in [0, 1].
-
-    All computation is CPU-compatible and uses only PyTorch.
+    (Logic unchanged from your version -- only `dbg(...)` calls added.)
     """
-    # Keep these modest for the 3-minute per-case limit. Increase them only
-    # after measuring the slowest convolutional case on your machine.
     SHARED_OPT_STEPS = 18
     TARGET_OPT_STEPS = 12
     OPT_LR = 5e-2
     OPT_TEMPERATURE = 0.5
     OPT_INIT_EPS = 5e-2
     CERT_TOL = 1e-8
+
+    def dbg(msg):
+        if debug:
+            print(f'[dbg]{(" " + tag) if tag else ""} [forward] {msg}', flush=True)
+
+    phase_start = time.perf_counter()
 
     model.eval()
     device = x.device
@@ -132,7 +46,6 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
     x_flat = x_detached.reshape(-1)
     input_dim = x_flat.numel()
 
-    # The project perturbation set is also clipped to the valid image range.
     original_x_l = torch.clamp(x_flat - eps, 0.0, 1.0)
     original_x_u = torch.clamp(x_flat + eps, 0.0, 1.0)
     original_box_l = original_x_l.reshape_as(x_detached)
@@ -147,24 +60,20 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
     float_eps = torch.finfo(dtype).eps
 
     def concrete_bounds(A_low, b_low, A_high, b_high, x_l, x_u):
-        """Concretize affine lower/upper expressions over [x_l, x_u]."""
         A_low_pos = A_low.clamp(min=0)
         A_low_neg = A_low.clamp(max=0)
         A_high_pos = A_high.clamp(min=0)
         A_high_neg = A_high.clamp(max=0)
-
         low = A_low_pos @ x_l + A_low_neg @ x_u + b_low
         high = A_high_pos @ x_u + A_high_neg @ x_l + b_high
         return low, high
 
     def concrete_lower(A, b, x_l, x_u):
-        """Concretize only a symbolic lower affine expression."""
         A_pos = A.clamp(min=0)
         A_neg = A.clamp(max=0)
         return A_pos @ x_l + A_neg @ x_u + b
 
     def make_parameters(alpha_values, move_inside=False):
-        """Clone slope tensors as independent learnable parameters."""
         params = []
         for value in alpha_values:
             init = value.detach().clone()
@@ -178,17 +87,10 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
             for alpha in alpha_params:
                 alpha.clamp_(0.0, 1.0)
 
-    def propagate(alpha_params=None, initialize_alpha=False, target_positions=None):
-        """
-        Propagate hybrid bounds and return direct lower bounds on output margins.
-
-        target_positions indexes `other_labels`, not the original class labels.
-        When it is None, all nine pairwise margins are returned.
-        """
+    def propagate(alpha_params=None, initialize_alpha=False, target_positions=None, unstable_counts=None):
         if alpha_params is None:
             alpha_params = []
 
-        # Symbolic bounds are expressed over the current normalized input box.
         x_l = original_x_l
         x_u = original_x_u
 
@@ -197,7 +99,6 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
         b_low = torch.zeros(input_dim, device=device, dtype=dtype)
         b_high = torch.zeros(input_dim, device=device, dtype=dtype)
 
-        # A second, independent IBP state is preserved throughout the network.
         box_low = original_box_l
         box_high = original_box_u
 
@@ -210,13 +111,8 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
                 sigma_full = layer.sigma.detach().to(device=device, dtype=dtype)
                 if torch.any(sigma_full <= 0):
                     raise ValueError('Normalization sigma must be positive.')
-
-                # Update the IBP tensor state.
                 box_low = (box_low - mean_full) / sigma_full
                 box_high = (box_high - mean_full) / sigma_full
-
-                # The symbolic identity is now interpreted over the normalized
-                # input interval, so only its domain endpoints change.
                 mean_flat = mean_full.reshape(-1)
                 sigma_flat = sigma_full.reshape(-1)
                 x_l = (x_l - mean_flat) / sigma_flat
@@ -231,13 +127,10 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
 
             if isinstance(layer, torch.nn.Linear):
                 W = layer.weight.detach().to(device=device, dtype=dtype)
-                b = None if layer.bias is None else layer.bias.detach().to(
-                    device=device, dtype=dtype
-                )
+                b = None if layer.bias is None else layer.bias.detach().to(device=device, dtype=dtype)
                 W_pos = W.clamp(min=0)
                 W_neg = W.clamp(max=0)
 
-                # Symbolic affine propagation.
                 new_A_low = W_pos @ A_low + W_neg @ A_high
                 new_A_high = W_pos @ A_high + W_neg @ A_low
                 new_b_low = W_pos @ b_low + W_neg @ b_high
@@ -248,7 +141,6 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
                 A_low, A_high = new_A_low, new_A_high
                 b_low, b_high = new_b_low, new_b_high
 
-                # Parallel IBP propagation.
                 box_low_flat = box_low.reshape(box_low.size(0), -1)
                 box_high_flat = box_high.reshape(box_high.size(0), -1)
                 new_box_low = box_low_flat @ W_pos.t() + box_high_flat @ W_neg.t()
@@ -262,32 +154,22 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
 
             if isinstance(layer, torch.nn.Conv2d):
                 if cur_shape is None:
-                    # Recover the feature-map shape directly from the IBP state.
                     if box_low.dim() != 4:
-                        raise RuntimeError(
-                            'Conv2d encountered without a valid feature-map shape.'
-                        )
+                        raise RuntimeError('Conv2d encountered without a valid feature-map shape.')
                     cur_shape = tuple(box_low.shape[-3:])
 
                 W = layer.weight.detach().to(device=device, dtype=dtype)
-                b = None if layer.bias is None else layer.bias.detach().to(
-                    device=device, dtype=dtype
-                )
+                b = None if layer.bias is None else layer.bias.detach().to(device=device, dtype=dtype)
                 C_in, H_in, W_in = cur_shape
                 W_pos = W.clamp(min=0)
                 W_neg = W.clamp(max=0)
 
                 def conv_coeff(weight, coeff):
-                    # coeff: [N_previous, input_dim]. Treat input_dim as batch.
                     coeff_img = coeff.t().reshape(input_dim, C_in, H_in, W_in)
                     return F.conv2d(
-                        coeff_img,
-                        weight,
-                        bias=None,
-                        stride=layer.stride,
-                        padding=layer.padding,
-                        dilation=layer.dilation,
-                        groups=layer.groups,
+                        coeff_img, weight, bias=None,
+                        stride=layer.stride, padding=layer.padding,
+                        dilation=layer.dilation, groups=layer.groups,
                     )
 
                 low_img = conv_coeff(W_pos, A_low) + conv_coeff(W_neg, A_high)
@@ -299,60 +181,37 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
                 def conv_bias(weight, bias_vector):
                     bias_img = bias_vector.reshape(1, C_in, H_in, W_in)
                     return F.conv2d(
-                        bias_img,
-                        weight,
-                        bias=None,
-                        stride=layer.stride,
-                        padding=layer.padding,
-                        dilation=layer.dilation,
-                        groups=layer.groups,
+                        bias_img, weight, bias=None,
+                        stride=layer.stride, padding=layer.padding,
+                        dilation=layer.dilation, groups=layer.groups,
                     ).reshape(-1)
 
                 new_b_low = conv_bias(W_pos, b_low) + conv_bias(W_neg, b_high)
                 new_b_high = conv_bias(W_pos, b_high) + conv_bias(W_neg, b_low)
                 if b is not None:
-                    expanded_bias = b.view(-1, 1, 1).expand(
-                        C_out, H_out, W_out
-                    ).reshape(-1)
+                    expanded_bias = b.view(-1, 1, 1).expand(C_out, H_out, W_out).reshape(-1)
                     new_b_low = new_b_low + expanded_bias
                     new_b_high = new_b_high + expanded_bias
                 A_low, A_high = new_A_low, new_A_high
                 b_low, b_high = new_b_low, new_b_high
 
-                # Parallel convolutional IBP propagation.
                 new_box_low = F.conv2d(
-                    box_low,
-                    W_pos,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    dilation=layer.dilation,
-                    groups=layer.groups,
+                    box_low, W_pos, bias=None,
+                    stride=layer.stride, padding=layer.padding,
+                    dilation=layer.dilation, groups=layer.groups,
                 ) + F.conv2d(
-                    box_high,
-                    W_neg,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    dilation=layer.dilation,
-                    groups=layer.groups,
+                    box_high, W_neg, bias=None,
+                    stride=layer.stride, padding=layer.padding,
+                    dilation=layer.dilation, groups=layer.groups,
                 )
                 new_box_high = F.conv2d(
-                    box_high,
-                    W_pos,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    dilation=layer.dilation,
-                    groups=layer.groups,
+                    box_high, W_pos, bias=None,
+                    stride=layer.stride, padding=layer.padding,
+                    dilation=layer.dilation, groups=layer.groups,
                 ) + F.conv2d(
-                    box_low,
-                    W_neg,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    dilation=layer.dilation,
-                    groups=layer.groups,
+                    box_low, W_neg, bias=None,
+                    stride=layer.stride, padding=layer.padding,
+                    dilation=layer.dilation, groups=layer.groups,
                 )
                 if b is not None:
                     bias_img = b.view(1, -1, 1, 1)
@@ -363,17 +222,12 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
                 continue
 
             if isinstance(layer, torch.nn.ReLU):
-                affine_l, affine_u = concrete_bounds(
-                    A_low, b_low, A_high, b_high, x_l, x_u
-                )
+                affine_l, affine_u = concrete_bounds(A_low, b_low, A_high, b_high, x_l, x_u)
                 box_l_flat = box_low.reshape(-1)
                 box_u_flat = box_high.reshape(-1)
 
-                # Intersect two independently sound abstractions.
                 l = torch.maximum(affine_l, box_l_flat)
                 u = torch.minimum(affine_u, box_u_flat)
-
-                # Avoid tiny contradictory intervals caused only by float noise.
                 u = torch.maximum(u, l)
 
                 neg_mask = u <= 0
@@ -381,20 +235,15 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
                 cross_mask = (~neg_mask) & (~pos_mask)
                 neuron_count = l.numel()
 
+                if unstable_counts is not None:
+                    unstable_counts.append(int(cross_mask.sum().item()))
+
                 if initialize_alpha:
-                    initial_alpha = torch.where(
-                        u >= -l,
-                        torch.ones_like(l),
-                        torch.zeros_like(l),
-                    )
-                    alpha_params.append(
-                        torch.nn.Parameter(initial_alpha.detach().clone())
-                    )
+                    initial_alpha = torch.where(u >= -l, torch.ones_like(l), torch.zeros_like(l))
+                    alpha_params.append(torch.nn.Parameter(initial_alpha.detach().clone()))
 
                 if relu_id >= len(alpha_params):
-                    raise RuntimeError(
-                        'Missing alpha parameters for ReLU layer {}'.format(relu_id)
-                    )
+                    raise RuntimeError('Missing alpha parameters for ReLU layer {}'.format(relu_id))
                 alpha = alpha_params[relu_id]
                 if alpha.numel() != neuron_count:
                     raise RuntimeError(
@@ -408,50 +257,23 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
                 zeros = torch.zeros_like(l)
                 ones = torch.ones_like(l)
 
-                # Symbolic lower relaxation. The separate box state retains
-                # the stronger concrete fact ReLU(z) >= 0.
-                lower_scale = torch.where(
-                    pos_mask,
-                    ones,
-                    torch.where(cross_mask, alpha_safe, zeros),
-                )
+                lower_scale = torch.where(pos_mask, ones, torch.where(cross_mask, alpha_safe, zeros))
                 A_low = lower_scale.unsqueeze(1) * A_low
                 b_low = lower_scale * b_low
 
-                # Standard secant upper relaxation over the tightened [l, u].
-                denominator = torch.where(
-                    cross_mask,
-                    (u - l).clamp_min(float_eps),
-                    torch.ones_like(u),
-                )
-                upper_slope_cross = torch.where(
-                    cross_mask,
-                    u / denominator,
-                    torch.zeros_like(u),
-                )
-                upper_scale = torch.where(
-                    pos_mask,
-                    ones,
-                    torch.where(cross_mask, upper_slope_cross, zeros),
-                )
-                upper_intercept = torch.where(
-                    cross_mask,
-                    -upper_slope_cross * l,
-                    zeros,
-                )
+                denominator = torch.where(cross_mask, (u - l).clamp_min(float_eps), torch.ones_like(u))
+                upper_slope_cross = torch.where(cross_mask, u / denominator, torch.zeros_like(u))
+                upper_scale = torch.where(pos_mask, ones, torch.where(cross_mask, upper_slope_cross, zeros))
+                upper_intercept = torch.where(cross_mask, -upper_slope_cross * l, zeros)
                 A_high = upper_scale.unsqueeze(1) * A_high
                 b_high = upper_scale * b_high + upper_intercept
 
-                # Keep exact interval non-negativity for all future IBP steps.
                 box_low = torch.clamp(l, min=0).reshape_as(box_low)
                 box_high = torch.clamp(u, min=0).reshape_as(box_high)
                 continue
 
-            raise NotImplementedError(
-                'Unsupported layer type before output: {}'.format(type(layer))
-            )
+            raise NotImplementedError('Unsupported layer type before output: {}'.format(type(layer)))
 
-        # Directly propagate pairwise margins through the final Linear layer.
         W_out = output_layer.weight.detach().to(device=device, dtype=dtype)
         b_out = output_layer.bias
         if b_out is None:
@@ -464,119 +286,111 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
         else:
             selected_labels = other_labels.index_select(0, target_positions)
 
-        W_margin = W_out[true_label].unsqueeze(0) - W_out.index_select(
-            0, selected_labels
-        )
+        W_margin = W_out[true_label].unsqueeze(0) - W_out.index_select(0, selected_labels)
         b_margin = b_out[true_label] - b_out.index_select(0, selected_labels)
         W_margin_pos = W_margin.clamp(min=0)
         W_margin_neg = W_margin.clamp(max=0)
 
         margin_A_low = W_margin_pos @ A_low + W_margin_neg @ A_high
-        margin_b_low = (
-            W_margin_pos @ b_low
-            + W_margin_neg @ b_high
-            + b_margin
-        )
-        affine_margin_lower = concrete_lower(
-            margin_A_low, margin_b_low, x_l, x_u
-        )
+        margin_b_low = W_margin_pos @ b_low + W_margin_neg @ b_high + b_margin
+        affine_margin_lower = concrete_lower(margin_A_low, margin_b_low, x_l, x_u)
 
         box_l_flat = box_low.reshape(-1)
         box_u_flat = box_high.reshape(-1)
-        box_margin_lower = (
-            W_margin_pos @ box_l_flat
-            + W_margin_neg @ box_u_flat
-            + b_margin
-        )
+        box_margin_lower = W_margin_pos @ box_l_flat + W_margin_neg @ box_u_flat + b_margin
 
-        # Either sound abstraction may prove the margin; their maximum remains
-        # a sound lower bound because both are lower bounds on the same value.
-        hybrid_margin_lower = torch.maximum(
-            affine_margin_lower,
-            box_margin_lower,
-        )
+        hybrid_margin_lower = torch.maximum(affine_margin_lower, box_margin_lower)
         return hybrid_margin_lower, alpha_params
 
-    # Build the initial 0/1 DeepPoly heuristic and evaluate all margins.
     initial_alpha_params = []
+    unstable_counts = []
     with torch.enable_grad():
         initial_margins, initial_alpha_params = propagate(
-            alpha_params=initial_alpha_params,
-            initialize_alpha=True,
+            alpha_params=initial_alpha_params, initialize_alpha=True, unstable_counts=unstable_counts,
         )
+
+    dbg(
+        f'unstable_relu_neurons={sum(unstable_counts)} per_layer={unstable_counts} '
+        f'initial_min_margin={initial_margins.min().item():.4f} '
+        f'already_certified={int((initial_margins.detach() > CERT_TOL).sum().item())}/9'
+    )
 
     certified = initial_margins.detach() > CERT_TOL
     if bool(certified.all()):
+        dbg(f'VERIFIED from the 0/1 heuristic alone ({time.perf_counter() - phase_start:.2f}s)')
         return True
 
     if not initial_alpha_params:
+        dbg(f'NO unstable ReLU neurons -> forward hybrid gives up ({time.perf_counter() - phase_start:.2f}s)')
         return False
 
-    # Preserve the exact heuristic as a candidate, but optimize from slightly
-    # inside the interval so projected Adam is less likely to stick at 0 or 1.
     shared_params = make_parameters(initial_alpha_params, move_inside=True)
     shared_optimizer = torch.optim.Adam(shared_params, lr=OPT_LR)
 
+    shared_start = None
+    shared_end = None
     with torch.enable_grad():
-        for _ in range(SHARED_OPT_STEPS):
+        for step in range(SHARED_OPT_STEPS):
             shared_optimizer.zero_grad(set_to_none=True)
             margins, _ = propagate(alpha_params=shared_params)
 
-            # Different iterations may certify different target classes. This
-            # is sound: each pairwise inequality may use its own relaxation.
+            unresolved = ~certified
+            cur_min = margins.detach()[unresolved].min().item() if unresolved.any() else margins.detach().min().item()
+            if shared_start is None:
+                shared_start = cur_min
+            shared_end = cur_min
+
             certified = certified | (margins.detach() > CERT_TOL)
             if bool(certified.all()):
+                dbg(f'VERIFIED during shared opt at step {step} ({time.perf_counter() - phase_start:.2f}s)')
                 return True
 
-            unresolved = ~certified
-            unresolved_margins = margins[unresolved]
+            unresolved_margins = margins[~certified]
             if unresolved_margins.numel() == 0:
                 return True
 
-            loss = OPT_TEMPERATURE * torch.logsumexp(
-                -unresolved_margins / OPT_TEMPERATURE,
-                dim=0,
-            )
+            loss = OPT_TEMPERATURE * torch.logsumexp(-unresolved_margins / OPT_TEMPERATURE, dim=0)
             if not torch.isfinite(loss):
+                dbg(f'shared opt loss non-finite at step {step}, stopping early')
                 break
 
             loss.backward()
             shared_optimizer.step()
             project_alphas(shared_params)
 
-    # Check the state after the final shared optimizer update.
+    dbg(f'shared opt: min_margin {shared_start:.4f} -> {shared_end:.4f} over {SHARED_OPT_STEPS} steps')
+
     with torch.no_grad():
         shared_margins, _ = propagate(alpha_params=shared_params)
         certified = certified | (shared_margins > CERT_TOL)
+        dbg(f'after shared phase: certified={int(certified.sum().item())}/9')
         if bool(certified.all()):
+            dbg(f'VERIFIED after shared phase ({time.perf_counter() - phase_start:.2f}s)')
             return True
 
-    # Optimize a separate slope set for each remaining target class. A distinct
-    # alpha proof for each f_true - f_target inequality is still fully sound.
     unresolved_positions = (~certified).nonzero(as_tuple=True)[0].tolist()
-
-    # Start each target-specific search from the shared result, which usually
-    # gives a better warm start than returning to the original 0/1 heuristic.
     shared_values = [alpha.detach().clone() for alpha in shared_params]
+    dbg(f'{len(unresolved_positions)} classes unresolved -> per-target opt: {unresolved_positions}')
 
     for target_position in unresolved_positions:
-        target_index = torch.tensor(
-            [target_position], device=device, dtype=torch.long
-        )
+        target_index = torch.tensor([target_position], device=device, dtype=torch.long)
         target_params = make_parameters(shared_values, move_inside=False)
         target_optimizer = torch.optim.Adam(target_params, lr=OPT_LR)
 
         target_certified = False
+        start_v = None
+        end_v = None
         with torch.enable_grad():
-            for _ in range(TARGET_OPT_STEPS):
+            for step in range(TARGET_OPT_STEPS):
                 target_optimizer.zero_grad(set_to_none=True)
-                target_margin, _ = propagate(
-                    alpha_params=target_params,
-                    target_positions=target_index,
-                )
+                target_margin, _ = propagate(alpha_params=target_params, target_positions=target_index)
                 scalar_margin = target_margin[0]
+                cur_v = float(scalar_margin.detach())
+                if start_v is None:
+                    start_v = cur_v
+                end_v = cur_v
 
-                if float(scalar_margin.detach()) > CERT_TOL:
+                if cur_v > CERT_TOL:
                     target_certified = True
                     break
 
@@ -590,40 +404,36 @@ def _analyze_forward_hybrid(model, x, eps, true_label):
 
         if not target_certified:
             with torch.no_grad():
-                final_target_margin, _ = propagate(
-                    alpha_params=target_params,
-                    target_positions=target_index,
-                )
-                target_certified = bool(
-                    final_target_margin[0].item() > CERT_TOL
-                )
+                final_target_margin, _ = propagate(alpha_params=target_params, target_positions=target_index)
+                end_v = final_target_margin[0].item()
+                target_certified = bool(end_v > CERT_TOL)
+
+        dbg(f'target class_idx={target_position}: margin {start_v:.4f} -> {end_v:.4f} certified={target_certified}')
 
         if not target_certified:
+            dbg(f'class_idx={target_position} could NOT be certified -> forward hybrid fails ({time.perf_counter() - phase_start:.2f}s)')
             return False
 
+    dbg(f'VERIFIED after per-target phase ({time.perf_counter() - phase_start:.2f}s)')
     return True
 
 
-
-def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0):
+def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0, debug=False, tag=""):
     """
     Target-specific CROWN/DeepPoly backward substitution with optimized ReLU
-    lower slopes. This path is mainly intended as a fallback for convolutional
-    cases that the forward hybrid verifier cannot certify.
-
-    Soundness:
-      * Forward IBP supplies sound pre-activation intervals [l, u].
-      * For an unstable ReLU, the lower line alpha*z is sound for every
-        alpha in [0, 1].
-      * A positive backward coefficient uses the lower line; a negative
-        coefficient uses the fixed upper secant.
-      * Each competing class is proved independently, so it may use its own
-        optimized slope tensors.
+    lower slopes. (Logic unchanged from your version -- only `dbg(...)` calls added.)
     """
     CROWN_OPT_STEPS = 32
     CROWN_LR = 8e-2
     CERT_TOL = 1e-7
     PARAM_EPS = 2e-3
+
+    def dbg(msg):
+        if debug:
+            print(f'[dbg]{(" " + tag) if tag else ""} [crown] {msg}', flush=True)
+
+    phase_start = time.perf_counter()
+    dbg(f'starting, time_budget_seconds={time_budget_seconds:.1f}')
 
     model.eval()
     device = x.device
@@ -632,9 +442,7 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
 
     layers = list(model.layers.children())
     if not layers or not isinstance(layers[-1], torch.nn.Linear):
-        raise NotImplementedError(
-            'CROWN fallback expects the final network layer to be Linear.'
-        )
+        raise NotImplementedError('CROWN fallback expects the final network layer to be Linear.')
 
     input_low = torch.clamp(x.detach() - eps, 0.0, 1.0)
     input_high = torch.clamp(x.detach() + eps, 0.0, 1.0)
@@ -649,10 +457,6 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
             return tensor
         return tensor.reshape(tensor.size(0), -1).sum(dim=1)
 
-    # ------------------------------------------------------------------
-    # Stage 1: forward IBP. Keep one record per network layer so the
-    # backward pass can invert Flatten shapes and use each ReLU's [l, u].
-    # ------------------------------------------------------------------
     records = []
     low = input_low
     high = input_high
@@ -668,30 +472,18 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
                     raise ValueError('Normalization sigma must be positive.')
                 low = (low - mean) / sigma
                 high = (high - mean) / sigma
-                records.append({
-                    'layer': layer,
-                    'input_shape': input_shape,
-                    'output_shape': tuple(low.shape),
-                    'mean': mean,
-                    'sigma': sigma,
-                })
+                records.append({'layer': layer, 'input_shape': input_shape, 'output_shape': tuple(low.shape), 'mean': mean, 'sigma': sigma})
                 continue
 
             if isinstance(layer, torch.nn.Flatten):
                 low = low.reshape(low.size(0), -1)
                 high = high.reshape(high.size(0), -1)
-                records.append({
-                    'layer': layer,
-                    'input_shape': input_shape,
-                    'output_shape': tuple(low.shape),
-                })
+                records.append({'layer': layer, 'input_shape': input_shape, 'output_shape': tuple(low.shape)})
                 continue
 
             if isinstance(layer, torch.nn.Linear):
                 weight = layer.weight.detach().to(device=device, dtype=dtype)
-                bias = None if layer.bias is None else layer.bias.detach().to(
-                    device=device, dtype=dtype
-                )
+                bias = None if layer.bias is None else layer.bias.detach().to(device=device, dtype=dtype)
                 weight_pos = weight.clamp(min=0)
                 weight_neg = weight.clamp(max=0)
                 old_low = low.reshape(low.size(0), -1)
@@ -701,68 +493,24 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
                 if bias is not None:
                     low = low + bias
                     high = high + bias
-                records.append({
-                    'layer': layer,
-                    'input_shape': input_shape,
-                    'output_shape': tuple(low.shape),
-                    'weight': weight,
-                    'bias': bias,
-                })
+                records.append({'layer': layer, 'input_shape': input_shape, 'output_shape': tuple(low.shape), 'weight': weight, 'bias': bias})
                 continue
 
             if isinstance(layer, torch.nn.Conv2d):
                 weight = layer.weight.detach().to(device=device, dtype=dtype)
-                bias = None if layer.bias is None else layer.bias.detach().to(
-                    device=device, dtype=dtype
-                )
+                bias = None if layer.bias is None else layer.bias.detach().to(device=device, dtype=dtype)
                 weight_pos = weight.clamp(min=0)
                 weight_neg = weight.clamp(max=0)
                 old_low, old_high = low, high
-                low = F.conv2d(
-                    old_low,
-                    weight_pos,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    dilation=layer.dilation,
-                    groups=layer.groups,
-                ) + F.conv2d(
-                    old_high,
-                    weight_neg,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    dilation=layer.dilation,
-                    groups=layer.groups,
-                )
-                high = F.conv2d(
-                    old_high,
-                    weight_pos,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    dilation=layer.dilation,
-                    groups=layer.groups,
-                ) + F.conv2d(
-                    old_low,
-                    weight_neg,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    dilation=layer.dilation,
-                    groups=layer.groups,
-                )
+                low = F.conv2d(old_low, weight_pos, bias=None, stride=layer.stride, padding=layer.padding, dilation=layer.dilation, groups=layer.groups) + \
+                    F.conv2d(old_high, weight_neg, bias=None, stride=layer.stride, padding=layer.padding, dilation=layer.dilation, groups=layer.groups)
+                high = F.conv2d(old_high, weight_pos, bias=None, stride=layer.stride, padding=layer.padding, dilation=layer.dilation, groups=layer.groups) + \
+                    F.conv2d(old_low, weight_neg, bias=None, stride=layer.stride, padding=layer.padding, dilation=layer.dilation, groups=layer.groups)
                 if bias is not None:
                     bias_img = bias.view(1, -1, 1, 1)
                     low = low + bias_img
                     high = high + bias_img
-                records.append({
-                    'layer': layer,
-                    'input_shape': input_shape,
-                    'output_shape': tuple(low.shape),
-                    'weight': weight,
-                    'bias': bias,
-                })
+                records.append({'layer': layer, 'input_shape': input_shape, 'output_shape': tuple(low.shape), 'weight': weight, 'bias': bias})
                 continue
 
             if isinstance(layer, torch.nn.ReLU):
@@ -770,20 +518,10 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
                 pre_high = high.clone()
                 low = torch.clamp(pre_low, min=0)
                 high = torch.clamp(pre_high, min=0)
-                records.append({
-                    'layer': layer,
-                    'input_shape': input_shape,
-                    'output_shape': tuple(low.shape),
-                    'pre_low': pre_low,
-                    'pre_high': pre_high,
-                })
+                records.append({'layer': layer, 'input_shape': input_shape, 'output_shape': tuple(low.shape), 'pre_low': pre_low, 'pre_high': pre_high})
                 continue
 
-            raise NotImplementedError(
-                'Unsupported layer type in CROWN forward pass: {}'.format(
-                    type(layer)
-                )
-            )
+            raise NotImplementedError('Unsupported layer type in CROWN forward pass: {}'.format(type(layer)))
 
     output_low = low.reshape(-1)
     output_high = high.reshape(-1)
@@ -791,10 +529,7 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
     if not (0 <= true_label < output_size):
         raise ValueError('true_label is outside the output dimension.')
 
-    relu_records = [
-        record for record in records
-        if isinstance(record['layer'], torch.nn.ReLU)
-    ]
+    relu_records = [record for record in records if isinstance(record['layer'], torch.nn.ReLU)]
 
     def alpha_candidate(kind):
         values = []
@@ -808,9 +543,7 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
             upper_slope = torch.where(unstable, u / denominator, torch.zeros_like(u))
 
             if kind == 'heuristic':
-                unstable_value = torch.where(
-                    u >= -l, torch.ones_like(u), torch.zeros_like(u)
-                )
+                unstable_value = torch.where(u >= -l, torch.ones_like(u), torch.zeros_like(u))
             elif kind == 'half':
                 unstable_value = torch.full_like(u, 0.5)
             elif kind == 'secant':
@@ -818,11 +551,7 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
             else:
                 raise ValueError('Unknown alpha candidate: {}'.format(kind))
 
-            alpha = torch.where(
-                pos,
-                torch.ones_like(u),
-                torch.where(unstable, unstable_value, torch.zeros_like(u)),
-            )
+            alpha = torch.where(pos, torch.ones_like(u), torch.where(unstable, unstable_value, torch.zeros_like(u)))
             values.append(alpha)
         return values
 
@@ -838,10 +567,7 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
         return [torch.sigmoid(theta) for theta in theta_params]
 
     def crown_margin_lower(target_label, alpha_values):
-        """Return a differentiable lower bound on f_true - f_target."""
-        coefficient = torch.zeros(
-            1, output_size, device=device, dtype=dtype
-        )
+        coefficient = torch.zeros(1, output_size, device=device, dtype=dtype)
         coefficient[0, true_label] = 1.0
         coefficient[0, target_label] = -1.0
         bound_bias = torch.zeros(1, device=device, dtype=dtype)
@@ -860,9 +586,7 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
                 continue
 
             if isinstance(layer, torch.nn.Flatten):
-                coefficient = coefficient.reshape(
-                    (coefficient.size(0),) + record['input_shape'][1:]
-                )
+                coefficient = coefficient.reshape((coefficient.size(0),) + record['input_shape'][1:])
                 continue
 
             if isinstance(layer, torch.nn.ReLU):
@@ -877,53 +601,26 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
                 zeros = torch.zeros_like(u)
                 ones = torch.ones_like(u)
 
-                lower_slope = torch.where(
-                    pos,
-                    ones,
-                    torch.where(unstable, alpha, zeros),
-                )
+                lower_slope = torch.where(pos, ones, torch.where(unstable, alpha, zeros))
 
-                denominator = torch.where(
-                    unstable,
-                    (u - l).clamp_min(torch.finfo(dtype).eps),
-                    torch.ones_like(u),
-                )
-                unstable_upper_slope = torch.where(
-                    unstable, u / denominator, zeros
-                )
-                upper_slope = torch.where(
-                    pos,
-                    ones,
-                    torch.where(unstable, unstable_upper_slope, zeros),
-                )
-                upper_intercept = torch.where(
-                    unstable,
-                    -l * unstable_upper_slope,
-                    zeros,
-                )
+                denominator = torch.where(unstable, (u - l).clamp_min(torch.finfo(dtype).eps), torch.ones_like(u))
+                unstable_upper_slope = torch.where(unstable, u / denominator, zeros)
+                upper_slope = torch.where(pos, ones, torch.where(unstable, unstable_upper_slope, zeros))
+                upper_intercept = torch.where(unstable, -l * unstable_upper_slope, zeros)
 
                 positive_coefficient = coefficient.clamp(min=0)
                 negative_coefficient = coefficient.clamp(max=0)
-                bound_bias = bound_bias + _sum_nonbatch(
-                    negative_coefficient * upper_intercept.unsqueeze(0)
-                )
-                coefficient = (
-                    positive_coefficient * lower_slope.unsqueeze(0)
-                    + negative_coefficient * upper_slope.unsqueeze(0)
-                )
+                bound_bias = bound_bias + _sum_nonbatch(negative_coefficient * upper_intercept.unsqueeze(0))
+                coefficient = positive_coefficient * lower_slope.unsqueeze(0) + negative_coefficient * upper_slope.unsqueeze(0)
                 continue
 
             if isinstance(layer, torch.nn.Conv2d):
                 weight = record['weight']
                 bias = record['bias']
                 if coefficient.dim() != 4:
-                    raise RuntimeError(
-                        'Conv2d backward coefficient must be four-dimensional.'
-                    )
+                    raise RuntimeError('Conv2d backward coefficient must be four-dimensional.')
                 if bias is not None:
-                    bound_bias = bound_bias + _sum_nonbatch(
-                        coefficient * bias.view(1, -1, 1, 1)
-                    )
+                    bound_bias = bound_bias + _sum_nonbatch(coefficient * bias.view(1, -1, 1, 1))
 
                 stride_h, stride_w = _pair(layer.stride)
                 pad_h, pad_w = _pair(layer.padding)
@@ -932,94 +629,59 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
                 input_h, input_w = record['input_shape'][-2:]
                 output_h, output_w = coefficient.shape[-2:]
 
-                base_h = (
-                    (output_h - 1) * stride_h
-                    - 2 * pad_h
-                    + dil_h * (kernel_h - 1)
-                    + 1
-                )
-                base_w = (
-                    (output_w - 1) * stride_w
-                    - 2 * pad_w
-                    + dil_w * (kernel_w - 1)
-                    + 1
-                )
+                base_h = (output_h - 1) * stride_h - 2 * pad_h + dil_h * (kernel_h - 1) + 1
+                base_w = (output_w - 1) * stride_w - 2 * pad_w + dil_w * (kernel_w - 1) + 1
                 output_padding_h = input_h - base_h
                 output_padding_w = input_w - base_w
                 if not (0 <= output_padding_h < stride_h):
-                    raise RuntimeError(
-                        'Invalid conv_transpose2d output_padding height: {}'.format(
-                            output_padding_h
-                        )
-                    )
+                    raise RuntimeError('Invalid conv_transpose2d output_padding height: {}'.format(output_padding_h))
                 if not (0 <= output_padding_w < stride_w):
-                    raise RuntimeError(
-                        'Invalid conv_transpose2d output_padding width: {}'.format(
-                            output_padding_w
-                        )
-                    )
+                    raise RuntimeError('Invalid conv_transpose2d output_padding width: {}'.format(output_padding_w))
 
                 coefficient = F.conv_transpose2d(
-                    coefficient,
-                    weight,
-                    bias=None,
-                    stride=layer.stride,
-                    padding=layer.padding,
-                    output_padding=(output_padding_h, output_padding_w),
-                    groups=layer.groups,
-                    dilation=layer.dilation,
+                    coefficient, weight, bias=None, stride=layer.stride, padding=layer.padding,
+                    output_padding=(output_padding_h, output_padding_w), groups=layer.groups, dilation=layer.dilation,
                 )
                 continue
 
             if isinstance(layer, Normalization):
                 mean = record['mean']
                 sigma = record['sigma']
-                bound_bias = bound_bias + _sum_nonbatch(
-                    coefficient * (-mean / sigma)
-                )
+                bound_bias = bound_bias + _sum_nonbatch(coefficient * (-mean / sigma))
                 coefficient = coefficient / sigma
                 continue
 
-            raise NotImplementedError(
-                'Unsupported layer type in CROWN backward pass: {}'.format(
-                    type(layer)
-                )
-            )
+            raise NotImplementedError('Unsupported layer type in CROWN backward pass: {}'.format(type(layer)))
 
         if relu_index != -1:
             raise RuntimeError('Not all ReLU slope tensors were consumed.')
 
         coefficient_pos = coefficient.clamp(min=0)
         coefficient_neg = coefficient.clamp(max=0)
-        lower = bound_bias + _sum_nonbatch(
-            coefficient_pos * input_low + coefficient_neg * input_high
-        )
+        lower = bound_bias + _sum_nonbatch(coefficient_pos * input_low + coefficient_neg * input_high)
         return lower[0]
 
-    # Evaluate the hardest pairwise margins first. This often saves substantial
-    # time on genuinely non-robust or currently unprovable cases.
     target_labels = [label for label in range(output_size) if label != true_label]
-    target_labels.sort(
-        key=lambda label: float(output_low[true_label] - output_high[label])
-    )
+    target_labels.sort(key=lambda label: float(output_low[true_label] - output_high[label]))
 
     candidate_names = ('heuristic', 'half', 'secant')
     candidate_sets = [alpha_candidate(name) for name in candidate_names]
 
     for target_label in target_labels:
         if time.perf_counter() >= deadline:
+            dbg(f'deadline reached before target_label={target_label} -> NOT VERIFIED ({time.perf_counter() - phase_start:.2f}s)')
             return False
 
-        # The direct IBP margin is already a sound proof when positive.
         ibp_margin = output_low[true_label] - output_high[target_label]
         if float(ibp_margin) > CERT_TOL:
+            dbg(f'target_label={target_label} already certified by plain IBP (margin={float(ibp_margin):.4f})')
             continue
 
         best_margin_value = -float('inf')
         best_alpha_values = None
 
         with torch.no_grad():
-            for candidate in candidate_sets:
+            for name, candidate in zip(candidate_names, candidate_sets):
                 margin = crown_margin_lower(target_label, candidate)
                 value = float(margin)
                 if value > best_margin_value:
@@ -1028,18 +690,24 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
                 if value > CERT_TOL:
                     break
 
+        dbg(f'target_label={target_label} best candidate init margin={best_margin_value:.4f}')
+
         if best_margin_value > CERT_TOL:
+            dbg(f'target_label={target_label} certified by candidate init alone')
             continue
         if best_alpha_values is None or not relu_records:
+            dbg(f'target_label={target_label} no relu params to optimize -> NOT VERIFIED')
             return False
 
         theta_params = theta_from_alpha(best_alpha_values)
         optimizer = torch.optim.Adam(theta_params, lr=CROWN_LR)
         best_theta_state = [theta.detach().clone() for theta in theta_params]
+        opt_start_margin = best_margin_value
 
         with torch.enable_grad():
             for step in range(CROWN_OPT_STEPS):
                 if time.perf_counter() >= deadline:
+                    dbg(f'target_label={target_label} deadline hit mid-optimization at step {step}')
                     break
 
                 optimizer.zero_grad(set_to_none=True)
@@ -1049,73 +717,73 @@ def _analyze_crown_backward(model, x, eps, true_label, time_budget_seconds=165.0
 
                 if margin_value > best_margin_value:
                     best_margin_value = margin_value
-                    best_theta_state = [
-                        theta.detach().clone() for theta in theta_params
-                    ]
+                    best_theta_state = [theta.detach().clone() for theta in theta_params]
                 if margin_value > CERT_TOL:
                     break
                 if not torch.isfinite(margin):
+                    dbg(f'target_label={target_label} margin non-finite at step {step}, stopping')
                     break
 
                 (-margin).backward()
                 optimizer.step()
 
-                # A small learning-rate drop helps settle near a useful corner
-                # without making the first half of optimization too timid.
                 if step == CROWN_OPT_STEPS // 2:
                     for group in optimizer.param_groups:
                         group['lr'] *= 0.35
 
         if best_margin_value <= CERT_TOL:
             with torch.no_grad():
-                restored_alphas = [
-                    torch.sigmoid(theta) for theta in best_theta_state
-                ]
-                restored_margin = crown_margin_lower(
-                    target_label, restored_alphas
-                )
-                best_margin_value = max(
-                    best_margin_value, float(restored_margin)
-                )
+                restored_alphas = [torch.sigmoid(theta) for theta in best_theta_state]
+                restored_margin = crown_margin_lower(target_label, restored_alphas)
+                best_margin_value = max(best_margin_value, float(restored_margin))
+
+        dbg(
+            f'target_label={target_label}: margin {opt_start_margin:.4f} -> {best_margin_value:.4f} '
+            f'certified={best_margin_value > CERT_TOL}'
+        )
 
         if best_margin_value <= CERT_TOL:
+            dbg(f'target_label={target_label} could NOT be certified -> NOT VERIFIED ({time.perf_counter() - phase_start:.2f}s)')
             return False
 
+    dbg(f'VERIFIED, all target labels certified ({time.perf_counter() - phase_start:.2f}s)')
     return True
 
 
-def analyze(model, x, eps, true_label):
+def analyze(model, x, eps, true_label, debug=False, tag=""):
     """
     Preserve the existing 64%-level forward hybrid verifier as the first pass.
     For convolutional cases that it cannot prove, use target-specific CROWN
     backward substitution with optimized alpha slopes as a fallback.
     """
+    def dbg(msg):
+        if debug:
+            print(f'[dbg]{(" " + tag) if tag else ""} {msg}', flush=True)
+
     start_time = time.perf_counter()
-    forward_result = _analyze_forward_hybrid(model, x, eps, true_label)
+    forward_result = _analyze_forward_hybrid(model, x, eps, true_label, debug=debug, tag=tag)
     if forward_result:
+        dbg(f'total_time={time.perf_counter() - start_time:.2f}s result=VERIFIED (forward)')
         return True
 
-    has_convolution = any(
-        isinstance(layer, torch.nn.Conv2d)
-        for layer in model.layers.children()
-    )
+    has_convolution = any(isinstance(layer, torch.nn.Conv2d) for layer in model.layers.children())
     if not has_convolution:
+        dbg(f'total_time={time.perf_counter() - start_time:.2f}s result=NOT VERIFIED (no conv, no fallback)')
         return False
 
-    # Leave a safety margin under the project's three-minute limit. If the
-    # original forward pass was already very slow, do not risk timing out.
     elapsed = time.perf_counter() - start_time
     remaining_budget = 168.0 - elapsed
+    dbg(f'forward failed after {elapsed:.2f}s, remaining_budget={remaining_budget:.2f}s -> trying CROWN backward fallback')
     if remaining_budget < 5.0:
+        dbg(f'total_time={time.perf_counter() - start_time:.2f}s result=NOT VERIFIED (not enough budget left for fallback)')
         return False
 
-    return _analyze_crown_backward(
-        model,
-        x,
-        eps,
-        true_label,
-        time_budget_seconds=remaining_budget,
+    result = _analyze_crown_backward(
+        model, x, eps, true_label, time_budget_seconds=remaining_budget, debug=debug, tag=tag,
     )
+    dbg(f'total_time={time.perf_counter() - start_time:.2f}s result={"VERIFIED" if result else "NOT VERIFIED"} (crown fallback)')
+    return result
+
 
 def load_network(net_name):
     if net_name == 'fc1':
@@ -1155,7 +823,7 @@ def parse_spec(spec_path):
     return true_label, pixel_values, eps
 
 
-def run_single_case(net_name, spec_path):
+def run_single_case(net_name, spec_path, debug=False, tag=""):
     true_label, pixel_values, eps = parse_spec(spec_path)
     net = load_network(net_name)
 
@@ -1164,7 +832,7 @@ def run_single_case(net_name, spec_path):
     pred_label = outs.max(dim=1)[1].item()
     assert pred_label == true_label
 
-    result = analyze(net, inputs, eps, true_label)
+    result = analyze(net, inputs, eps, true_label, debug=debug, tag=tag)
     return result
 
 
@@ -1193,8 +861,9 @@ def run_all_cases(test_dir):
             status = 'verified' if result else 'not verified'
             print(f'{net_name}\t{os.path.basename(spec_path)}\t{status}')
 
-# run single case: python verifier.py --net fc1 --spec ../test_cases/fc1/img0_0.09500.txt
-# run all cases: python verifier.py --batch --tests-dir ../test_cases
+# run single case: python verifier_debug.py --net fc1 --spec ../test_cases/fc1/img0_0.09500.txt --debug
+# run all cases: python verifier_debug.py --batch --tests-dir ../test_cases
+
 
 def main():
     parser = argparse.ArgumentParser(description='Neural network verification')
@@ -1202,6 +871,7 @@ def main():
     parser.add_argument('--spec', type=str, help='Test case to verify')
     parser.add_argument('--batch', action='store_true', help='Run all test cases under the tests directory')
     parser.add_argument('--tests-dir', type=str, default='../test_cases', help='Directory with the test case folders')
+    parser.add_argument('--debug', action='store_true', help='Print diagnostic trace')
     args = parser.parse_args()
 
     if args.batch:
@@ -1219,7 +889,7 @@ def main():
     pred_label = outs.max(dim=1)[1].item()
     assert pred_label == true_label
 
-    if analyze(net, inputs, eps, true_label):
+    if analyze(net, inputs, eps, true_label, debug=args.debug, tag=os.path.basename(args.spec)):
         print('verified')
     else:
         print('not verified')
