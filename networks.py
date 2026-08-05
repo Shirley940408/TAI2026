@@ -14,17 +14,6 @@ class Normalization(nn.Module):
 
 
 class FullyConnected(nn.Module):
-    '''
-    这是一个全连接网络类。
-    它做的事情是：
-    先加一个归一化层
-    再把 28*28 的图像展开成一维向量
-    然后依次经过几个线性层 nn.Linear
-    在每两个全连接层之间插入一个 ReLU 激活函数
-    整个网络结构大致是:
-    输入图像 -> 归一化 -> 展平成 784 维 -> Linear → ReLU → Linear → ReLU → ... 最终输出 10 个类别分数
-    '''
-
     def __init__(self, device, input_size, fc_layers):
         super(FullyConnected, self).__init__()
 
@@ -42,18 +31,7 @@ class FullyConnected(nn.Module):
 
 
 class Conv(nn.Module):
-    '''
-    这是一个卷积网络类。
-    它做的事情是:
-    先加一个归一化层
-    然后依次经过几个卷积层 nn.Conv2d
-    在每两个卷积层之间插入一个 ReLU 激活函数
-    然后把卷积层的输出展平成一维向量
-    再依次经过几个线性层 nn.Linear
-    在每两个全连接层之间插入一个 ReLU 激活函数
-    最终输出 10 个类别分数
-'''
-
+    
     def __init__(self, device, input_size, conv_layers, fc_layers, n_class=10):
         super(Conv, self).__init__()
 

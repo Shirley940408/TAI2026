@@ -6,26 +6,8 @@ Method stack, from cheapest to strongest:
   Stage 0 -- PGD falsification.
       A concrete counterexample settles a non-robust case immediately.
 
-  Stage 1 -- DeepPoly by backsubstitution, intersected with interval (IBP)
-      bounds, ReLU lower slopes `alpha` optimised by projected Adam.
-
-      The distinction that matters here: forward symbolic propagation
-      (A_low <- W+ @ A_low + W- @ A_high) commits each ReLU to a lower or
-      upper line using the sign of the LOCAL weight, before the downstream
-      coefficients are known.  Backsubstitution pushes the target expression
-      back one layer at a time and picks each line from the sign of the
-      ACCUMULATED coefficient, once cancellation along the whole downstream
-      path is known.  On identical relaxations and identical alpha the gap
-      grows sharply with depth -- on random 5-hidden-layer networks at
-      eps=0.1 the margin bound went from -11.8 (forward) to -0.77
-      (backsubstitution), and the count of unstable neurons in the deepest
-      layers roughly halved.  Every intermediate pre-activation bound is
-      therefore backsubstituted too, not just the output margin.
-
-      The forward symbolic pass is kept as an extra intersection source: it
-      is cheap, always sound, and still useful for the wide convolutional
-      layers where full backsubstitution of intermediate bounds would blow
-      the time budget.
+  Stage 1 -- DeepPoly: forward symbolic affine bounds intersected with
+      interval bounds, ReLU lower slopes `alpha` optimised by projected Adam.
 
   Stage 2 -- k-ReLU multi-neuron joint relaxation (Singh et al., NeurIPS
       2019; the same family PRIMA generalises).  This is the part that moves
@@ -464,13 +446,6 @@ class _Verifier:
     MN_MAX_GROUPS_INTER = 10
     MN_D_LR = 2e-1
 
-    # DeepPoly backsubstitution.  Intermediate bounds for a layer are only
-    # backsubstituted when the coefficient matrices stay under this many
-    # elements; oversized conv layers keep their (sound, looser) forward
-    # symbolic bounds instead.  The output margin is always backsubstituted,
-    # since it is only a handful of rows.
-    MAX_BACKSUB_ELEMS = 6_000_000
-
     # Stage 3 (branch and bound).
     SUB_STEPS = 6
     SUB_LR = 8e-2
@@ -510,20 +485,6 @@ class _Verifier:
             1 for layer in self.body_layers if isinstance(layer, torch.nn.ReLU)
         )
         self.first_map = self._first_relu_affine_map()
-
-        # Per-layer shapes, needed to reshape backsubstitution coefficients
-        # and to size conv_transpose2d correctly.
-        self.layer_in_shape = []
-        self.layer_out_shape = []
-        probe = torch.zeros_like(self.x)
-        with torch.no_grad():
-            for layer in self.body_layers:
-                self.layer_in_shape.append(tuple(probe.shape[1:]))
-                probe = layer(probe)
-                self.layer_out_shape.append(tuple(probe.shape[1:]))
-        self.layer_in_numel = [
-            int(torch.tensor(shape).prod()) for shape in self.layer_in_shape
-        ]
 
         self.has_conv = any(
             isinstance(layer, torch.nn.Conv2d) for layer in self.body_layers
@@ -579,108 +540,6 @@ class _Verifier:
             return None
 
         return None
-
-    # -- DeepPoly backsubstitution ------------------------------------------
-
-    @staticmethod
-    def _pair(value):
-        return value if isinstance(value, tuple) else (value, value)
-
-    def backsub_affordable(self, rows, i0):
-        cost = 0
-        for i in range(i0, -1, -1):
-            cost += rows * self.layer_in_numel[i]
-            if cost > self.MAX_BACKSUB_ELEMS:
-                return False
-        return True
-
-    def backsub(self, A, k, i0, lower, relaxations):
-        """Push an affine form back to the raw input, one layer at a time.
-
-        `A` holds coefficients over the output of body_layers[i0], shape
-        [rows, numel].  Unlike forward symbolic propagation, the lower/upper
-        line of each ReLU is chosen from the sign of the ACCUMULATED
-        coefficient -- after all cancellation along the downstream path is
-        known -- which is what makes this DeepPoly rather than symbolic
-        interval propagation.
-
-        Returns (A, k) over the raw (un-normalised) input, or None if some
-        relaxation on the path has not been built yet.
-        """
-        device, dtype = self.device, self.dtype
-
-        for i in range(i0, -1, -1):
-            layer = self.body_layers[i]
-
-            if isinstance(layer, torch.nn.ReLU):
-                relaxation = relaxations[i]
-                if relaxation is None:
-                    return None
-                lower_scale, upper_scale, upper_intercept = relaxation
-                P, N = A.clamp(min=0), A.clamp(max=0)
-                if lower:
-                    k = k + N @ upper_intercept
-                    A = P * lower_scale + N * upper_scale
-                else:
-                    k = k + P @ upper_intercept
-                    A = P * upper_scale + N * lower_scale
-                continue
-
-            if isinstance(layer, torch.nn.Flatten):
-                continue
-
-            if isinstance(layer, torch.nn.Linear):
-                W = layer.weight.detach().to(device=device, dtype=dtype)
-                if layer.bias is not None:
-                    k = k + A @ layer.bias.detach().to(device=device, dtype=dtype)
-                A = A @ W
-                continue
-
-            if isinstance(layer, Normalization):
-                shape = self.layer_in_shape[i]
-                mean = layer.mean.detach().to(device=device, dtype=dtype)
-                sigma = layer.sigma.detach().to(device=device, dtype=dtype)
-                mean = mean.expand(1, *shape).reshape(-1)
-                sigma = sigma.expand(1, *shape).reshape(-1)
-                k = k + A @ (-mean / sigma)
-                A = A / sigma
-                continue
-
-            if isinstance(layer, torch.nn.Conv2d):
-                W = layer.weight.detach().to(device=device, dtype=dtype)
-                C_out, H_out, W_out = self.layer_out_shape[i]
-                C_in, H_in, W_in = self.layer_in_shape[i]
-
-                if layer.bias is not None:
-                    bias = layer.bias.detach().to(device=device, dtype=dtype)
-                    k = k + A @ bias.view(-1, 1, 1).expand(
-                        C_out, H_out, W_out
-                    ).reshape(-1)
-
-                rows = A.size(0)
-                A4 = A.reshape(rows, C_out, H_out, W_out)
-                stride_h, stride_w = self._pair(layer.stride)
-                pad_h, pad_w = self._pair(layer.padding)
-                dil_h, dil_w = self._pair(layer.dilation)
-                ker_h, ker_w = self._pair(layer.kernel_size)
-                base_h = (H_out - 1) * stride_h - 2 * pad_h + dil_h * (ker_h - 1) + 1
-                base_w = (W_out - 1) * stride_w - 2 * pad_w + dil_w * (ker_w - 1) + 1
-                out_pad_h, out_pad_w = H_in - base_h, W_in - base_w
-                if not (0 <= out_pad_h < stride_h and 0 <= out_pad_w < stride_w):
-                    return None
-                A4 = F.conv_transpose2d(
-                    A4, W, bias=None, stride=layer.stride, padding=layer.padding,
-                    output_padding=(out_pad_h, out_pad_w), groups=layer.groups,
-                    dilation=layer.dilation,
-                )
-                A = A4.reshape(rows, -1)
-                continue
-
-            raise NotImplementedError(
-                'Unsupported layer in backsubstitution: {}'.format(type(layer))
-            )
-
-        return A, k
 
     # -- input box tightening from split constraints ------------------------
 
@@ -814,10 +673,6 @@ class _Verifier:
 
         device, dtype = self.device, self.dtype
 
-        # Backsubstitution concretises against the raw input box, since it
-        # walks back through the Normalization layer itself.
-        orig_l, orig_u = x_l, x_u
-
         A_low = torch.eye(self.input_dim, device=device, dtype=dtype)
         A_high = torch.eye(self.input_dim, device=device, dtype=dtype)
         b_low = torch.zeros(self.input_dim, device=device, dtype=dtype)
@@ -832,9 +687,8 @@ class _Verifier:
         last_tail = None
         prev_was_relu = False
         pending_refined = None
-        relaxations = [None] * len(self.body_layers)
 
-        for layer_idx, layer in enumerate(self.body_layers):
+        for layer in self.body_layers:
 
             if isinstance(layer, Normalization):
                 mean_full = layer.mean.detach().to(device=device, dtype=dtype)
@@ -868,7 +722,7 @@ class _Verifier:
                 if (mn is not None and mn.intermediate and prev_was_relu
                         and last_tail is not None):
                     pending_refined = self._intermediate_refinement(
-                        mn, last_tail, W, b
+                        mn, last_tail, W, b, x_l, x_u
                     )
 
                 W_pos, W_neg = W.clamp(min=0), W.clamp(max=0)
@@ -969,26 +823,6 @@ class _Verifier:
                 l = torch.maximum(affine_l, box_low.reshape(-1))
                 u = torch.minimum(affine_u, box_high.reshape(-1))
 
-                # ---- DeepPoly backsubstitution -----------------------------
-                # This is the main source of precision: it defers every ReLU's
-                # line choice until the accumulated coefficient is known.
-                back_low = back_high = None
-                n_here = l.numel()
-                if layer_idx > 0 and self.backsub_affordable(n_here, layer_idx - 1):
-                    eye = torch.eye(n_here, device=device, dtype=dtype)
-                    zero = torch.zeros(n_here, device=device, dtype=dtype)
-                    res_lo = self.backsub(eye, zero, layer_idx - 1, True, relaxations)
-                    res_hi = self.backsub(eye, zero, layer_idx - 1, False, relaxations)
-                    if res_lo is not None and res_hi is not None:
-                        bA_low, bb_low = res_lo
-                        bA_high, bb_high = res_hi
-                        back_low = (bA_low.clamp(min=0) @ orig_l
-                                    + bA_low.clamp(max=0) @ orig_u + bb_low)
-                        back_high = (bA_high.clamp(min=0) @ orig_u
-                                     + bA_high.clamp(max=0) @ orig_l + bb_high)
-                        l = torch.maximum(l, back_low)
-                        u = torch.minimum(u, back_high)
-
                 # k-ReLU bounds computed at the preceding affine layer.
                 if pending_refined is not None:
                     r_l, r_u = pending_refined
@@ -1008,7 +842,7 @@ class _Verifier:
 
                     if neg_ids:
                         idx = torch.tensor(neg_ids, device=device, dtype=torch.long)
-                        if float(l.index_select(0, idx).detach().max()) > FEAS_TOL:
+                        if float(l.index_select(0, idx).max()) > FEAS_TOL:
                             return None
                         u = u.index_put((idx,), u.index_select(0, idx).clamp(max=0.0))
                         l = l.index_put(
@@ -1019,7 +853,7 @@ class _Verifier:
 
                     if pos_ids:
                         idx = torch.tensor(pos_ids, device=device, dtype=torch.long)
-                        if float(u.index_select(0, idx).detach().min()) < -FEAS_TOL:
+                        if float(u.index_select(0, idx).min()) < -FEAS_TOL:
                             return None
                         l = l.index_put((idx,), l.index_select(0, idx).clamp(min=0.0))
                         u = u.index_put(
@@ -1028,7 +862,7 @@ class _Verifier:
                                           l.index_select(0, idx)),
                         )
 
-                    if float((l - u).detach().max()) > FEAS_TOL:
+                    if float((l - u).max()) > FEAS_TOL:
                         return None
 
                 neg_mask = u <= 0
@@ -1067,29 +901,14 @@ class _Verifier:
                 )
                 upper_intercept = torch.where(cross_mask, -upper_slope * l, zeros)
 
-                relaxations[layer_idx] = (lower_scale, upper_scale, upper_intercept)
-
-                # Pre-activation state, kept for the joint relaxation.  Prefer
-                # the backsubstituted symbolic expressions when we have them:
-                # they are tighter, so the octahedral group bounds derived
-                # from them are tighter too.
-                if back_low is not None:
-                    tail_A_low, tail_b_low = bA_low, bb_low
-                    tail_A_high, tail_b_high = bA_high, bb_high
-                    tail_l, tail_u = orig_l, orig_u
-                else:
-                    tail_A_low, tail_b_low = A_low, b_low
-                    tail_A_high, tail_b_high = A_high, b_high
-                    tail_l, tail_u = x_l, x_u
-
+                # Pre-activation state, kept for the joint relaxation.
                 last_tail = {
                     'index': this_relu,
-                    'A_low': tail_A_low, 'b_low': tail_b_low,
-                    'A_high': tail_A_high, 'b_high': tail_b_high,
+                    'A_low': A_low, 'b_low': b_low,
+                    'A_high': A_high, 'b_high': b_high,
                     'l': l, 'u': u, 'cross': cross_mask,
                     'lower_scale': lower_scale, 'upper_scale': upper_scale,
                     'upper_intercept': upper_intercept,
-                    'x_l': tail_l, 'x_u': tail_u,
                 }
 
                 A_low = lower_scale.unsqueeze(1) * A_low
@@ -1143,26 +962,13 @@ class _Verifier:
         )
         margins = torch.maximum(affine_margin, box_margin)
 
-        # ---- DeepPoly backsubstitution of the margin ----------------------
-        # Only a handful of rows, so this is always affordable and it is where
-        # the deferred line choice pays off most.
-        if self.body_layers:
-            res = self.backsub(
-                W_margin, b_margin, len(self.body_layers) - 1, True, relaxations
-            )
-            if res is not None:
-                bA, bk = res
-                back_margin = (bA.clamp(min=0) @ orig_l
-                               + bA.clamp(max=0) @ orig_u + bk)
-                margins = torch.maximum(margins, back_margin)
-
         # ---- k-ReLU joint relaxation at the output margin ------------------
         if (mn is not None and mn.margin_groups is not None
                 and self.margin_refinable and last_tail is not None
                 and W_margin.size(0) == mn.margin_d.size(0)):
             refined = _refine_linear_forms(
                 W_margin, b_margin, mn.margin_groups, mn.margin_d,
-                last_tail, last_tail['x_l'], last_tail['x_u'],
+                last_tail, x_l, x_u,
             )
             if refined is not None:
                 margins = torch.maximum(margins, refined)
@@ -1172,13 +978,12 @@ class _Verifier:
             return margins, extra, last_tail, x_l, x_u
         return margins, extra
 
-    def _intermediate_refinement(self, mn, tail, W, b):
+    def _intermediate_refinement(self, mn, tail, W, b, x_l, x_u):
         """Tighter pre-activation bounds for  W @ ReLU(z) + b  via k-ReLU.
 
         Uses the DeepPoly-equivalent d, so no extra parameters are introduced
         and the result is guaranteed to be at least as tight as DeepPoly.
         """
-        x_l, x_u = tail['x_l'], tail['x_u']
         key = tail['index']
         groups = mn.layer_groups.get(key)
         if groups is None:
@@ -1239,10 +1044,9 @@ class _Verifier:
             )
         if result is None:
             return mn
-        _, _, tail, _, _ = result
+        _, _, tail, norm_l, norm_u = result
         if tail is None:
             return mn
-        tail_l, tail_u = tail['x_l'], tail['x_u']
 
         W_out = self.output_layer.weight.detach()
         selected = self.other_labels[target_pos]
@@ -1253,7 +1057,7 @@ class _Verifier:
             return mn
 
         with torch.no_grad():
-            groups = self.build_margin_groups(tail, c_row, tail_l, tail_u)
+            groups = self.build_margin_groups(tail, c_row, norm_l, norm_u)
         if groups is None:
             return mn
 
@@ -1623,8 +1427,8 @@ def run_all_cases(test_dir):
             print(f'{net_name}\t{os.path.basename(spec_path)}\t{status}\t{elapsed:.1f}s')
 
 
-# run single case: python verifier.py --net fc1 --spec ../test_cases/fc1/img0_0.09500.txt
-# run all cases: python verifier.py --batch --tests-dir ../test_cases
+# run single case: python kreLu_verifier.py --net fc1 --spec ../test_cases/fc1/img0_0.09500.txt
+# run all cases: python kreLu_verifier.py --batch --tests-dir ../test_cases
 
 def main():
     parser = argparse.ArgumentParser(description='Neural network verification')

@@ -1008,7 +1008,7 @@ class _Verifier:
 
                     if neg_ids:
                         idx = torch.tensor(neg_ids, device=device, dtype=torch.long)
-                        if float(l.index_select(0, idx).detach().max()) > FEAS_TOL:
+                        if float(l.index_select(0, idx).max()) > FEAS_TOL:
                             return None
                         u = u.index_put((idx,), u.index_select(0, idx).clamp(max=0.0))
                         l = l.index_put(
@@ -1019,7 +1019,7 @@ class _Verifier:
 
                     if pos_ids:
                         idx = torch.tensor(pos_ids, device=device, dtype=torch.long)
-                        if float(u.index_select(0, idx).detach().min()) < -FEAS_TOL:
+                        if float(u.index_select(0, idx).min()) < -FEAS_TOL:
                             return None
                         l = l.index_put((idx,), l.index_select(0, idx).clamp(min=0.0))
                         u = u.index_put(
@@ -1028,7 +1028,7 @@ class _Verifier:
                                           l.index_select(0, idx)),
                         )
 
-                    if float((l - u).detach().max()) > FEAS_TOL:
+                    if float((l - u).max()) > FEAS_TOL:
                         return None
 
                 neg_mask = u <= 0
@@ -1623,8 +1623,8 @@ def run_all_cases(test_dir):
             print(f'{net_name}\t{os.path.basename(spec_path)}\t{status}\t{elapsed:.1f}s')
 
 
-# run single case: python verifier.py --net fc1 --spec ../test_cases/fc1/img0_0.09500.txt
-# run all cases: python verifier.py --batch --tests-dir ../test_cases
+# run single case: python backsub_verifier.py --net fc1 --spec ../test_cases/fc1/img0_0.09500.txt
+# run all cases: python backsub_verifier.py --batch --tests-dir ../test_cases
 
 def main():
     parser = argparse.ArgumentParser(description='Neural network verification')
